@@ -40,6 +40,19 @@
 
 - `memory_get_entry` / `memory_get_reasoning` の転送を 200KB でキャップ（DB 内の原本は無損失のまま）
 
+### 意味検索（ハイブリッド検索）
+
+- sqlite-vec + OpenAI 互換 `/embeddings` による埋め込み層 `vectors.db` を追加（完全な派生物）
+- `memory_search` が FTS 結果に要約・事実の意味的近傍（`match: "semantic"`）を付加。FTS5 が日本語の言い回し違いで取りこぼすケースを補完
+- `embed` コマンド（一括バックフィル）。`consolidate` は新規分を自動埋め込み
+- 設定キー `embedding_model` を追加（空 = 無効）
+
+### 運用
+
+- `db backup`: 3 DB を `VACUUM INTO` で整合スナップショット化し `backup_dir` に世代管理保存（`--keep N`）
+- 設定キー `backup_dir` を追加
+- サーバーポートを `AGENTS_RELAY_PORT` 環境変数で上書き可能に（テスト用）
+
 ---
 
 ## [0.2.0] - 2026-04-01

@@ -57,7 +57,14 @@ serve (MCP stdio)                       ──┘
 
 追記専用のため、再実行・クラッシュリトライで重複行は生じ得るが損失は構造的に生じない。`db restore-archive <file.jsonl>` で冪等復元（既存エントリはスキップ、content は inline/fulltext に再分配）。
 
-### 3.5 転送キャップ
+### 3.5 vectors.db（埋め込み・ATTACH 名 `vdb`）
+
+- `vec_summaries` / `vec_facts` — sqlite-vec (vec0) による要約・事実の埋め込み。`vec_meta` にモデル名と次元を記録し、モデル変更時は索引を破棄して再生成する。
+- 埋め込みは OpenAI 互換 `/embeddings`（`embedding_model` 設定時のみ）。`consolidate` が新規分を自動埋め込み、`embed` コマンドで一括バックフィル。
+- `memory_search` は FTS 結果に加えて `match: "semantic"` の近傍（要約 3 件 + 事実 3 件）を付加する。埋め込みサービス不達時は静かに FTS のみになる。
+- 完全な派生物。ファイルごと削除しても `embed` で再生成できる。
+
+### 3.6 転送キャップ
 
 MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[transport limit: full N bytes stored losslessly in DB]` を付記）。DB 内は無損失のまま。
 
@@ -105,7 +112,9 @@ MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[t
 
 ## 7. CLI
 
-`serve` / `server` / `ingest` / `sync` / `list` / `export` / `write` / `query` / `summarize` / `consolidate` / `archive` / `workspace` / `config` / `db {stats, vacuum, reset, rebuild-fts, export-light, backfill-fulltext, restore-archive}` / `tool`（デバッグ用直接呼び出し）
+`serve` / `server` / `ingest` / `sync` / `list` / `export` / `write` / `query` / `summarize` / `consolidate` / `embed` / `archive` / `workspace` / `config` / `db {stats, vacuum, reset, rebuild-fts, export-light, backfill-fulltext, restore-archive, backup}` / `tool`（デバッグ用直接呼び出し）
+
+サーバーポートは `AGENTS_RELAY_PORT` 環境変数で上書き可能（テスト・並行環境用。既定 54322）。
 
 ## 8. 設定（~/.agents-relay/config.json）
 
@@ -118,9 +127,11 @@ MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[t
 | `reasoning_llm_base_url` | `http://localhost:1234/v1` | OpenAI 互換 API |
 | `reasoning_llm_model` | （空） | 空なら `/v1/models` から自動検出 |
 | `reasoning_llm_timeout_secs` | 120 | LLM 呼び出しタイムアウト |
+| `backup_dir` | `~/.agents-relay/backups` | `db backup` の出力先（別物理ディスク推奨） |
+| `embedding_model` | （空） | 意味検索用の埋め込みモデル。空なら無効 |
 
 ## 9. バックアップと復元
 
-- **フルバックアップ** = `memory.db` + `fulltext.db` + `reasoning.db` の 3 点（+ 必要なら `archive/`）。
+- **フルバックアップ** = `memory.db` + `fulltext.db` + `reasoning.db` の 3 点（+ 必要なら `archive/`）。`db backup` が `VACUUM INTO` で整合スナップショットを `backup_dir` に世代管理で作成する（`--keep N`、既定 3 世代）。
 - **軽量コピー** = `db export-light`（CoT・FTS 実体なし、sync_state 込み）。復元先で `db rebuild-fts` すれば検索まで完全復元。
 - FTS が壊れた場合は `db rebuild-fts` で常に再構築可能（索引は派生物）。

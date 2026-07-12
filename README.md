@@ -28,6 +28,7 @@ Claude Code と Antigravity のセッション履歴を SQLite に取り込み�
 | `fulltext.db` | 50KB 超の本文の**全文原本** | 消すと全文が失われる |
 | `reasoning.db` | 生 chain-of-thought（thinking）の原本 | 消しても検索は無傷 |
 | `archive/YYYY/MM/DD.jsonl` | アーカイブ済みエントリの無損失原本（追記専用） | 消すと復元不能 |
+| `vectors.db` | 要約・事実の埋め込みベクトル（意味検索用） | `embed` で再生成可 |
 | `memory-light.db` | `db export-light` の派生物（持ち出し用） | いつでも再生成可 |
 
 ## インストール
@@ -81,10 +82,20 @@ agents-relay config set reasoning_llm_enabled true
 agents-relay config set reasoning_llm_base_url http://localhost:1234/v1
 ```
 
+### 意味検索（ハイブリッド検索）
+
+FTS5 は日本語の分かち書きに弱く、言い回しが違うと当たりません。埋め込みモデル（bge-m3 等）を設定すると、`memory_search` が FTS の結果に加えて要約・事実の意味的近傍を返すようになります。
+
+```bash
+agents-relay config set embedding_model text-embedding-bge-m3
+agents-relay embed   # 既存の要約・事実をベクトル化（以後は consolidate が自動で埋め込む）
+```
+
 ### 管理 CLI
 
 ```bash
 agents-relay db stats             # 件数・DB 別サイズ
+agents-relay db backup            # 3 DB を backup_dir へ整合スナップショット（世代ローテーション）
 agents-relay db backfill-fulltext # 過去に切り詰めた本文・CoT を元 JSONL から回収
 agents-relay db export-light      # 軽量コピー生成（持ち出し用）
 agents-relay db rebuild-fts       # FTS 索引の再構築
@@ -106,7 +117,9 @@ agents-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
   "reasoning_llm_enabled": false,                    // consolidate / CoT 要約に LLM を使うか
   "reasoning_llm_base_url": "http://localhost:1234/v1",
   "reasoning_llm_model": "",                         // 空なら /v1/models から自動検出
-  "reasoning_llm_timeout_secs": 120
+  "reasoning_llm_timeout_secs": 120,
+  "backup_dir": "~/.agents-relay/backups",           // db backup の出力先（別ディスク推奨）
+  "embedding_model": ""                              // 意味検索用の埋め込みモデル（空 = 無効）
 }
 ```
 

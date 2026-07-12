@@ -28,6 +28,7 @@ So I built this from scratch.
 | `fulltext.db` | **Full original text** of bodies over 50KB | Deleting loses full texts |
 | `reasoning.db` | Raw chain-of-thought (thinking) originals | Search survives deletion |
 | `archive/YYYY/MM/DD.jsonl` | Lossless originals of archived entries (append-only) | Deleting loses restore data |
+| `vectors.db` | Embedding vectors of summaries/facts (semantic search) | Regenerable via `embed` |
 | `memory-light.db` | Derived output of `db export-light` (for transport) | Regenerable anytime |
 
 ## Install
@@ -81,10 +82,20 @@ agents-relay config set reasoning_llm_enabled true
 agents-relay config set reasoning_llm_base_url http://localhost:1234/v1
 ```
 
+### Semantic search (hybrid retrieval)
+
+FTS5 handles Japanese poorly (no word segmentation), so rephrased queries miss. Once an embedding model (e.g. bge-m3) is configured, `memory_search` augments FTS results with semantic neighbors from summaries and facts.
+
+```bash
+agents-relay config set embedding_model text-embedding-bge-m3
+agents-relay embed   # 既存の要約・事実をベクトル化（以後は consolidate が自動で埋め込む）
+```
+
 ### Admin CLI
 
 ```bash
 agents-relay db stats             # 件数・DB 別サイズ
+agents-relay db backup            # 3 DB を backup_dir へ整合スナップショット（世代ローテーション）
 agents-relay db backfill-fulltext # 過去に切り詰めた本文・CoT を元 JSONL から回収
 agents-relay db export-light      # 軽量コピー生成（持ち出し用）
 agents-relay db rebuild-fts       # FTS 索引の再構築
@@ -106,7 +117,9 @@ agents-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
   "reasoning_llm_enabled": false,                    // consolidate / CoT 要約に LLM を使うか
   "reasoning_llm_base_url": "http://localhost:1234/v1",
   "reasoning_llm_model": "",                         // 空なら /v1/models から自動検出
-  "reasoning_llm_timeout_secs": 120
+  "reasoning_llm_timeout_secs": 120,
+  "backup_dir": "~/.agents-relay/backups",           // db backup の出力先（別ディスク推奨）
+  "embedding_model": ""                              // 意味検索用の埋め込みモデル（空 = 無効）
 }
 ```
 

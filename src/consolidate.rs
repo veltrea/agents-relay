@@ -106,6 +106,11 @@ pub fn run(
         }
     }
 
+    // 新しく作られた要約・事実の埋め込みを生成 (best-effort。失敗しても蒸留自体は成立)
+    if let Err(e) = embed_missing(conn, cfg) {
+        eprintln!("  [consolidate] embedding skipped: {e}");
+    }
+
     Ok(stats)
 }
 
@@ -201,4 +206,69 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
         out.push(c);
     }
     out
+}
+
+/// 埋め込み未生成の要約・事実をベクトル化して vdb に格納する。
+/// embedding_model が未設定なら何もしない。冪等・増分。
+/// 戻り値: (要約の埋め込み数, 事実の埋め込み数)
+pub fn embed_missing(conn: &Connection, cfg: &Config) -> Result<(u64, u64)> {
+    if cfg.embedding_model.is_empty() {
+        return Ok((0, 0));
+    }
+    let model = &cfg.embedding_model;
+    let base = &cfg.reasoning_llm_base_url;
+    let timeout = cfg.reasoning_llm_timeout_secs;
+
+    // 次元数の確定 (初回はプローブで 1 件埋め込んで判定)
+    let dim = match db::vec_state(conn)? {
+        Some((m, d)) if &m == model => d,
+        _ => {
+            let probe = reasoning::embed_texts(&["dimension probe".to_string()], model, base, timeout)?;
+            let d = probe.first().map(|v| v.len()).unwrap_or(0);
+            if d == 0 {
+                anyhow::bail!("embedding model returned empty vector");
+            }
+            db::vec_init(conn, model, d)?;
+            d
+        }
+    };
+    let _ = dim;
+
+    let mut sum_count = 0u64;
+    let mut fact_count = 0u64;
+    const BATCH: i64 = 32;
+
+    loop {
+        let missing = db::summaries_missing_embedding(conn, BATCH)?;
+        if missing.is_empty() {
+            break;
+        }
+        let texts: Vec<String> = missing.iter().map(|(_, _, md)| md.clone()).collect();
+        let embs = reasoning::embed_texts(&texts, model, base, timeout)?;
+        if embs.len() != texts.len() {
+            anyhow::bail!("embeddings response count mismatch ({} != {})", embs.len(), texts.len());
+        }
+        for ((id, _, _), emb) in missing.iter().zip(embs.iter()) {
+            db::vec_upsert(conn, "vec_summaries", *id, emb)?;
+            sum_count += 1;
+        }
+    }
+
+    loop {
+        let missing = db::facts_missing_embedding(conn, BATCH)?;
+        if missing.is_empty() {
+            break;
+        }
+        let texts: Vec<String> = missing.iter().map(|(_, f)| f.clone()).collect();
+        let embs = reasoning::embed_texts(&texts, model, base, timeout)?;
+        if embs.len() != texts.len() {
+            anyhow::bail!("embeddings response count mismatch ({} != {})", embs.len(), texts.len());
+        }
+        for ((id, _), emb) in missing.iter().zip(embs.iter()) {
+            db::vec_upsert(conn, "vec_facts", *id, emb)?;
+            fact_count += 1;
+        }
+    }
+
+    Ok((sum_count, fact_count))
 }

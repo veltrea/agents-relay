@@ -2,7 +2,22 @@ use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::path::Path;
 
+/// sqlite-vec 拡張を全コネクションに登録する（プロセスごとに一度だけ）
+fn init_vec_extension() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| unsafe {
+        type InitFn = unsafe extern "C" fn(
+            *mut rusqlite::ffi::sqlite3,
+            *mut *const std::os::raw::c_char,
+            *const rusqlite::ffi::sqlite3_api_routines,
+        ) -> std::os::raw::c_int;
+        let init: InitFn = std::mem::transmute(sqlite_vec::sqlite3_vec_init as *const ());
+        rusqlite::ffi::sqlite3_auto_extension(Some(init));
+    });
+}
+
 pub fn open(path: &Path) -> Result<Connection> {
+    init_vec_extension();
     let conn = Connection::open(path)?;
     // 複数プロセスが同時起動した場合の BUSY 対策: 最大 5 秒待ってリトライ
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -29,9 +44,17 @@ fn attach_side_dbs(conn: &Connection, db_path: &Path) -> Result<()> {
         "ATTACH DATABASE ?1 AS fdb",
         params![fpath.to_string_lossy()],
     )?;
+    // vectors.db (vdb): 要約・事実の埋め込みベクトル。完全に派生物であり、
+    // 削除しても embed コマンドで再生成できる。
+    let vpath = db_path.with_file_name("vectors.db");
+    conn.execute(
+        "ATTACH DATABASE ?1 AS vdb",
+        params![vpath.to_string_lossy()],
+    )?;
     conn.execute_batch(
         "PRAGMA rdb.journal_mode=WAL;
          PRAGMA fdb.journal_mode=WAL;
+         PRAGMA vdb.journal_mode=WAL;
          CREATE TABLE IF NOT EXISTS rdb.cot (
              entry_id INTEGER PRIMARY KEY,
              reasoning TEXT,
@@ -40,9 +63,134 @@ fn attach_side_dbs(conn: &Connection, db_path: &Path) -> Result<()> {
          CREATE TABLE IF NOT EXISTS fdb.fulltext (
              entry_id INTEGER PRIMARY KEY,
              content TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS vdb.vec_meta (
+             key TEXT PRIMARY KEY,
+             value TEXT NOT NULL
          );",
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// ベクトル索引 (sqlite-vec / vdb)
+// ---------------------------------------------------------------------------
+
+/// 現在のベクトル索引の (モデル名, 次元数)。未初期化なら None。
+pub fn vec_state(conn: &Connection) -> Result<Option<(String, usize)>> {
+    let model: Option<String> = conn
+        .query_row(
+            "SELECT value FROM vdb.vec_meta WHERE key = 'model'",
+            [],
+            |row| row.get(0),
+        )
+        .ok();
+    let dim: Option<usize> = conn
+        .query_row(
+            "SELECT value FROM vdb.vec_meta WHERE key = 'dim'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| s.parse().ok());
+    Ok(match (model, dim) {
+        (Some(m), Some(d)) => Some((m, d)),
+        _ => None,
+    })
+}
+
+/// ベクトル索引を (再) 初期化する。モデル・次元が変わったら既存索引は破棄
+/// （派生物なので安全）。
+pub fn vec_init(conn: &Connection, model: &str, dim: usize) -> Result<()> {
+    if let Some((m, d)) = vec_state(conn)? {
+        if m == model && d == dim {
+            return Ok(());
+        }
+        eprintln!("agents-relay: embedding model changed ({m}/{d} -> {model}/{dim}), rebuilding vector index");
+    }
+    conn.execute_batch(&format!(
+        "DROP TABLE IF EXISTS vdb.vec_summaries;
+         DROP TABLE IF EXISTS vdb.vec_facts;
+         CREATE VIRTUAL TABLE vdb.vec_summaries USING vec0(embedding float[{dim}]);
+         CREATE VIRTUAL TABLE vdb.vec_facts USING vec0(embedding float[{dim}]);"
+    ))?;
+    conn.execute(
+        "INSERT OR REPLACE INTO vdb.vec_meta (key, value) VALUES ('model', ?1)",
+        params![model],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO vdb.vec_meta (key, value) VALUES ('dim', ?1)",
+        params![dim.to_string()],
+    )?;
+    Ok(())
+}
+
+fn f32s_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// ベクトルを upsert する。table は "vec_summaries" | "vec_facts"。
+pub fn vec_upsert(conn: &Connection, table: &str, rowid: i64, embedding: &[f32]) -> Result<()> {
+    conn.execute(
+        &format!("DELETE FROM vdb.{table} WHERE rowid = ?1"),
+        params![rowid],
+    )?;
+    conn.execute(
+        &format!("INSERT INTO vdb.{table} (rowid, embedding) VALUES (?1, ?2)"),
+        params![rowid, f32s_to_blob(embedding)],
+    )?;
+    Ok(())
+}
+
+/// KNN 検索。戻り値: (rowid, distance) を近い順に。
+pub fn vec_search(
+    conn: &Connection,
+    table: &str,
+    query: &[f32],
+    k: usize,
+) -> Result<Vec<(i64, f64)>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT rowid, distance FROM vdb.{table}
+         WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance"
+    ))?;
+    let rows = stmt
+        .query_map(params![f32s_to_blob(query), k as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// まだ埋め込みが無い要約を返す (id, session_id, summary_md)
+pub fn summaries_missing_embedding(
+    conn: &Connection,
+    limit: i64,
+) -> Result<Vec<(i64, String, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT s.id, s.session_id, s.summary_md FROM summaries s
+         WHERE s.id NOT IN (SELECT rowid FROM vdb.vec_summaries)
+         ORDER BY s.id LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// まだ埋め込みが無い有効な事実を返す (id, fact)
+pub fn facts_missing_embedding(conn: &Connection, limit: i64) -> Result<Vec<(i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT f.id, f.fact FROM facts f
+         WHERE f.superseded_by IS NULL
+           AND f.id NOT IN (SELECT rowid FROM vdb.vec_facts)
+         ORDER BY f.id LIMIT ?1",
+    )?;
+    let rows = stmt
+        .query_map(params![limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// content をメイン DB に inline 保存する上限 (bytes)。
@@ -380,6 +528,51 @@ pub fn set_sync_offset(conn: &Connection, file_path: &str, offset: i64) -> Resul
         params![file_path, offset],
     )?;
     Ok(())
+}
+
+/// 3 つの DB (main / rdb / fdb) をタイムスタンプ付きディレクトリに整合バックアップする。
+/// VACUUM INTO を使うため、書き込みと並行しても一貫したスナップショットになり、
+/// 空きページも除かれてコンパクトになる。keep 世代を超えた古いセットは削除する。
+/// 戻り値: (作成したディレクトリ, 合計バイト数)
+pub fn backup(conn: &Connection, out_dir: &Path, keep: usize) -> Result<(std::path::PathBuf, u64)> {
+    let stamp = chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string();
+    let dest = out_dir.join(&stamp);
+    std::fs::create_dir_all(&dest)?;
+
+    let mut total = 0u64;
+    for (schema, fname) in [
+        ("main", "memory.db"),
+        ("rdb", "reasoning.db"),
+        ("fdb", "fulltext.db"),
+    ] {
+        let path = dest.join(fname);
+        // VACUUM INTO は出力先が既存だと失敗する（上書きしない = 安全側）
+        conn.execute(
+            &format!("VACUUM {schema} INTO ?1"),
+            params![path.to_string_lossy()],
+        )?;
+        total += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+    }
+
+    // 世代ローテーション: タイムスタンプ名のディレクトリを新しい順に keep 個残す
+    let mut sets: Vec<std::path::PathBuf> = std::fs::read_dir(out_dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.is_dir()
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.len() == 17 && n.as_bytes()[4] == b'-')
+                    .unwrap_or(false)
+        })
+        .collect();
+    sets.sort();
+    sets.reverse();
+    for old in sets.iter().skip(keep.max(1)) {
+        std::fs::remove_dir_all(old).ok();
+    }
+
+    Ok((dest, total))
 }
 
 // ---------------------------------------------------------------------------

@@ -41,6 +41,9 @@ enum Commands {
         action: DbAction,
     },
 
+    /// Generate embeddings for summaries and facts that lack them (semantic search index)
+    Embed,
+
     /// Distill finished sessions into summaries and durable facts (sleep-time consolidation)
     Consolidate {
         /// Max sessions to process per run
@@ -209,6 +212,15 @@ enum DbAction {
         /// Path to a .jsonl file under the archive directory
         path: std::path::PathBuf,
     },
+    /// Snapshot all three databases into the backup directory (with rotation)
+    Backup {
+        /// Output directory (default: backup_dir from config)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+        /// Number of backup sets to keep
+        #[arg(long, default_value = "3")]
+        keep: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -325,7 +337,27 @@ fn main() -> Result<()> {
                     println!("Note: run `db rebuild-fts` if search results look incomplete.");
                 }
             }
+            DbAction::Backup { out, keep } => {
+                let cfg = config::Config::load()?;
+                let out = out.unwrap_or_else(|| config::resolve_backup_dir(&cfg));
+                let (dest, bytes) = db::backup(&conn, &out, keep)?;
+                println!(
+                    "Backup complete: {} ({} MB, keeping {keep} sets)",
+                    dest.display(),
+                    bytes / 1_048_576
+                );
+            }
         },
+
+        Commands::Embed => {
+            let cfg = config::Config::load()?;
+            if cfg.embedding_model.is_empty() {
+                println!("embedding_model is not set. Enable with:\n  agents-relay config set embedding_model <model-id>");
+                return Ok(());
+            }
+            let (sums, facts) = consolidate::embed_missing(&conn, &cfg)?;
+            println!("Embedded {sums} summaries and {facts} facts (model: {}).", cfg.embedding_model);
+        }
 
         Commands::Consolidate { limit, min_entries, idle_mins, no_facts, upgrade } => {
             let cfg = config::Config::load()?;

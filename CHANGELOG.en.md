@@ -40,6 +40,19 @@ Storage was split into three tiers around one principle: never lose the original
 
 - `memory_get_entry` / `memory_get_reasoning` transport is capped at 200KB (stored data remains lossless)
 
+### Semantic search (hybrid retrieval)
+
+- Added an embedding tier `vectors.db` powered by sqlite-vec + an OpenAI-compatible `/embeddings` endpoint (fully derived)
+- `memory_search` augments FTS results with semantic neighbors of summaries and facts (`match: "semantic"`), covering the rephrasings that FTS5 misses on Japanese text
+- New `embed` command (bulk backfill); `consolidate` embeds new items automatically
+- New config key `embedding_model` (empty = disabled)
+
+### Operations
+
+- `db backup`: consistent snapshots of all three databases via `VACUUM INTO` under `backup_dir`, with rotation (`--keep N`)
+- New config key `backup_dir`
+- Server port can be overridden with the `AGENTS_RELAY_PORT` environment variable (for tests)
+
 ---
 
 ## [0.2.0] - 2026-04-01

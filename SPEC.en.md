@@ -57,7 +57,14 @@ For each date older than `retention_days`, the `archive` command:
 
 Because the JSONL is append-only, re-runs and crash retries may duplicate lines but can never lose data. `db restore-archive <file.jsonl>` restores idempotently (existing entries skipped; content re-split into inline/fulltext tiers).
 
-### 3.5 Transport cap
+### 3.5 vectors.db (embeddings, ATTACHed as `vdb`)
+
+- `vec_summaries` / `vec_facts` — sqlite-vec (vec0) embeddings of summaries and facts. `vec_meta` records the model name and dimension; a model change discards and rebuilds the index.
+- Embeddings come from an OpenAI-compatible `/embeddings` endpoint (only when `embedding_model` is set). `consolidate` embeds new items automatically; the `embed` command backfills in bulk.
+- `memory_search` augments FTS results with `match: "semantic"` neighbors (3 summaries + 3 facts). If the embedding service is unreachable, search silently degrades to FTS only.
+- Fully derived: the file can be deleted and regenerated with `embed`.
+
+### 3.6 Transport cap
 
 MCP response `content` / `reasoning` is capped at 200,000 bytes (annotated with `[transport limit: full N bytes stored losslessly in DB]`). Stored data remains lossless.
 
@@ -105,7 +112,9 @@ Originals are never modified. Summaries and facts are regenerable derived artifa
 
 ## 7. CLI
 
-`serve` / `server` / `ingest` / `sync` / `list` / `export` / `write` / `query` / `summarize` / `consolidate` / `archive` / `workspace` / `config` / `db {stats, vacuum, reset, rebuild-fts, export-light, backfill-fulltext, restore-archive}` / `tool` (direct invocation for debugging)
+`serve` / `server` / `ingest` / `sync` / `list` / `export` / `write` / `query` / `summarize` / `consolidate` / `embed` / `archive` / `workspace` / `config` / `db {stats, vacuum, reset, rebuild-fts, export-light, backfill-fulltext, restore-archive, backup}` / `tool` (direct invocation for debugging)
+
+The server port can be overridden with the `AGENTS_RELAY_PORT` environment variable (for tests and parallel setups; default 54322).
 
 ## 8. Configuration (~/.agents-relay/config.json)
 
@@ -118,9 +127,11 @@ Originals are never modified. Summaries and facts are regenerable derived artifa
 | `reasoning_llm_base_url` | `http://localhost:1234/v1` | OpenAI-compatible API |
 | `reasoning_llm_model` | (empty) | Empty = auto-detect via `/v1/models` |
 | `reasoning_llm_timeout_secs` | 120 | LLM call timeout |
+| `backup_dir` | `~/.agents-relay/backups` | Output directory for `db backup` (separate physical disk recommended) |
+| `embedding_model` | (empty) | Embedding model for semantic search; empty = disabled |
 
 ## 9. Backup and restore
 
-- **Full backup** = the trio of `memory.db` + `fulltext.db` + `reasoning.db` (plus `archive/` if desired).
+- **Full backup** = the trio of `memory.db` + `fulltext.db` + `reasoning.db` (plus `archive/` if desired). `db backup` creates consistent snapshots via `VACUUM INTO` under `backup_dir` with rotation (`--keep N`, default 3 sets).
 - **Light copy** = `db export-light` (no CoT, no FTS payload, includes sync_state). Run `db rebuild-fts` on the restored copy for full function including search.
 - A broken FTS index can always be rebuilt with `db rebuild-fts` (the index is a derived artifact).

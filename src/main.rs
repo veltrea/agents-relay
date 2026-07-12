@@ -289,8 +289,9 @@ fn main() -> Result<()> {
                 );
             }
             DbAction::BackfillFulltext => {
-                let (filled, remaining) = ingest::backfill_fulltext(&mut conn)?;
-                println!("Backfilled {filled} entries into fulltext.db.");
+                let (filled, remaining, cot_filled) = ingest::backfill_fulltext(&mut conn)?;
+                println!("Backfilled {filled} full texts into fulltext.db.");
+                println!("Backfilled {cot_filled} chain-of-thought blocks into reasoning.db.");
                 if remaining > 0 {
                     println!(
                         "{remaining} truncated entries remain (source files no longer available)."

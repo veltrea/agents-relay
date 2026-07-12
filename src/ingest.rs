@@ -298,14 +298,17 @@ fn parse_datetime(ts: &str) -> (String, String) {
     }
 }
 
-/// 過去に切り詰め保存されたエントリの全文を、元 JSONL から fdb.fulltext に回収する。
+/// 過去のエントリについて、元 JSONL から失われていたデータを回収する:
+/// - 切り詰め保存された本文の全文 → fdb.fulltext
+/// - 旧バイナリが捨てていた thinking (生 CoT) → rdb.cot
 /// 元ファイルが Claude Code のクリーンアップで消える前に一度実行しておくことで、
-/// 「全文原本」を DB 側で自己完結させる。冪等（再実行しても二重登録しない）。
-/// 戻り値: (回収できた件数, 未回収のまま残った切り詰めエントリ数)
-pub fn backfill_fulltext(conn: &mut Connection) -> Result<(u64, u64)> {
+/// 原本を DB 側で自己完結させる。冪等（再実行しても二重登録しない）。
+/// 戻り値: (全文回収件数, 未回収の切り詰めエントリ数, CoT 回収件数)
+pub fn backfill_fulltext(conn: &mut Connection) -> Result<(u64, u64, u64)> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
     let projects_dir = home.join(".claude").join("projects");
     let mut filled = 0u64;
+    let mut cot_filled = 0u64;
 
     if projects_dir.exists() {
         // .jsonl.bak は Claude Code がセッションを書き直した際の旧版で、
@@ -344,6 +347,52 @@ pub fn backfill_fulltext(conn: &mut Connection) -> Result<(u64, u64)> {
                     Some(p) => p,
                     None => continue,
                 };
+
+                // --- thinking (生 CoT) の回収 ---
+                // 旧バイナリは thinking を捨てて取り込んでいたため、既存行に
+                // CoT が付いていなければ元 JSONL から補完する。誤マッチで別の
+                // エントリに CoT を付けると害が大きいので、こちらは timestamp
+                // まで含めた厳密照合とし、さらに content の先頭も突き合わせる。
+                if let Some(ref reasoning) = parsed.reasoning {
+                    let candidates: Vec<(i64, String)> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT r.id, substr(r.content, 1, 200) FROM raw_entries r
+                             LEFT JOIN rdb.cot c ON c.entry_id = r.id
+                             WHERE r.session_id = ?1 AND r.timestamp = ?2 AND r.type = ?3
+                               AND c.entry_id IS NULL",
+                        )?;
+                        let rows: Vec<(i64, String)> = stmt
+                            .query_map(
+                                rusqlite::params![
+                                    parsed.session_id,
+                                    parsed.timestamp,
+                                    parsed.entry_type
+                                ],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )?
+                            .collect::<std::result::Result<_, _>>()?;
+                        rows
+                    };
+                    for (id, stored_head) in candidates {
+                        let limit = stored_head.len().min(parsed.content.len()).min(100);
+                        let n = db::truncate_at_char_boundary(&parsed.content, limit);
+                        let matches = n == 0 || stored_head.starts_with(&parsed.content[..n]);
+                        if matches {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO rdb.cot (entry_id, reasoning) VALUES (?1, ?2)",
+                                rusqlite::params![id, reasoning],
+                            )?;
+                            tx.execute(
+                                "UPDATE raw_entries SET reasoning_tokens = ?1
+                                 WHERE id = ?2 AND reasoning_tokens IS NULL",
+                                rusqlite::params![crate::reasoning::estimate_tokens(reasoning), id],
+                            )?;
+                            cot_filled += 1;
+                        }
+                    }
+                }
+
+                // --- 切り詰め本文の全文回収 ---
                 if parsed.content.len() <= db::CONTENT_INLINE_MAX {
                     continue;
                 }
@@ -407,7 +456,7 @@ pub fn backfill_fulltext(conn: &mut Connection) -> Result<(u64, u64)> {
         |row| row.get(0),
     )?;
 
-    Ok((filled, remaining))
+    Ok((filled, remaining, cot_filled))
 }
 
 /// sync_state の状態表示

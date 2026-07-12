@@ -1,118 +1,124 @@
-# claude-relay: A Quick-and-Dirty Session Memory Store for Claude Code
+# agents-relay: Session Memory for AI Coding Agents
+
+**他の言語で読む:** [日本語](README.md)
+
+A single binary that ingests Claude Code and Antigravity session history into SQLite and serves "past memory" as MCP tools. Formerly claude-relay; renamed when it went multi-agent.
 
 ## Background
 
 I forked [claude-mem](https://github.com/anthropics/claude-mem) (a session memory plugin for Claude Code) intending to make it work with local LLMs, but after reading through the source code, I honestly found it unusable.
 
-The design fires off an AI compression request for every single tool use, uses fetch with no timeout, has no retry strategy, conflates liveness with readiness, and irreversibly discards raw data after compression -- it's an implementation that misses the fundamentals of computer science. I wrote about the details in a [separate article](https://note.com/veltrea/n/n791d1defada0).
+Firing an AI compression request per tool use, fetches without timeouts, no retry strategy, confusing liveness with readiness, and irreversibly discarding raw data after compression — the fundamentals of computer science just weren't there. I wrote more about it in [a separate article](https://note.com/veltrea/n/n791d1defada0).
 
-These problems just don't surface when you're using the Claude API, but the moment you switch to a local LLM, every single one of them becomes fatal. I tried patching the fork, but these are design-level issues that can't be fixed with partial patches.
+Then it hit me: there is no reason to compress with AI at ingest time in the first place. Claude Code already writes every session to `~/.claude/projects/` as JSONL. Load that into SQLite **losslessly**, and treat summaries and compression as derived artifacts you can regenerate at any time.
 
-And then it hit me -- there's no reason to use AI compression in the first place. Claude Code already writes all session data as JSONL under `~/.claude/projects/`. Just shove it into SQLite and let Claude's own 1M context understand the raw data at query time. No AI compression, no daemon needed.
+So I built this from scratch.
 
-So I built **claude-relay** from scratch.
+## Design principles
 
-## What It Is
+1. **Never lose the original.** No truncation at ingest. Every deletion is preceded by a lossless export. Swap the summarization algorithm later and regenerate everything from the originals.
+2. **Save tokens on the presentation side, not the storage side.** Search results carry pointers instead of bulky data (chains of thought, huge bodies). Agents fetch the full data with a dedicated tool only when they decide they need it.
+3. **No daemons.** Incremental ingest by byte offset whenever an MCP tool is called.
 
-- A single Rust binary (around 1,600 lines)
-- Connects to Claude Code as an MCP server and provides tools for searching past sessions
-- No daemon required. It incrementally ingests JSONL files at session start and on tool invocations
-- You can also archive old data to Markdown and prune it from SQLite if you like
+## Storage layout (three tiers + derived artifacts)
 
-## Installation
+| File | Contents | Safe to delete? |
+|---|---|---|
+| `memory.db` | Entry bodies (inline) + FTS index + summaries + facts | No (the core) |
+| `fulltext.db` | **Full original text** of bodies over 50KB | Deleting loses full texts |
+| `reasoning.db` | Raw chain-of-thought (thinking) originals | Search survives deletion |
+| `archive/YYYY/MM/DD.jsonl` | Lossless originals of archived entries (append-only) | Deleting loses restore data |
+| `memory-light.db` | Derived output of `db export-light` (for transport) | Regenerable anytime |
 
-You'll need a Rust build environment.
+## Install
+
+Requires a Rust build environment.
 
 ```bash
-git clone https://github.com/veltrea/claude-relay.git
-cd claude-relay
+git clone https://github.com/veltrea/agents-relay.git
+cd agents-relay
 cargo build --release
 
-# Register as an MCP server in Claude Code
-claude mcp add --transport stdio --scope user claude-relay -- $(pwd)/target/release/claude-relay serve
+# Claude Code の MCP に登録
+claude mcp add --transport stdio --scope user agents-relay -- $(pwd)/target/release/agents-relay serve
 ```
-
-If you want it on your PATH, just copy `target/release/claude-relay` wherever you like.
 
 ## Usage
 
-### First, Ingest the JSONL Files
+### From Claude Code / Antigravity
+
+Register it as an MCP server and just ask inside a session. Ingest runs automatically on tool calls.
+
+- "What did I work on yesterday?"
+- "Find the session where we fixed OAuth"
+- "What did we decide in this project?" (→ `memory_facts` returns distilled decisions and constraints)
+- "Why did we choose that design back then?" (→ `memory_get_reasoning` returns the chain of thought from that moment)
+
+Main MCP tools:
+
+| Tool | Purpose |
+|---|---|
+| `memory_search` | FTS full-text search (also matches workspace and branch names) |
+| `memory_list_sessions` | Session list (with summary snippets once consolidated) |
+| `memory_get_session` | Full session history (session summary prepended) |
+| `memory_get_entry` | Full text of one entry (from the fulltext originals) |
+| `memory_get_reasoning` | Stored chain of thought (summary / full) |
+| `memory_facts` | Distilled durable facts (very low token cost) |
+
+### Sleep-time consolidation (distilling summaries and facts)
+
+Finished sessions are distilled with a local LLM (LM Studio or any OpenAI-compatible API). If the LLM is unreachable, it falls back to extractive compression, upgradeable later with `--upgrade`.
 
 ```bash
-# Ingest all sessions under ~/.claude/projects/
-claude-relay ingest ~/.claude/projects/
+# 直近の終了セッションを蒸留（要約 + 事実抽出）
+agents-relay consolidate
 
-# Or just a specific file
-claude-relay ingest path/to/session.jsonl
+# ヒューリスティック要約を LLM 要約に格上げ
+agents-relay consolidate --upgrade
 
-# Check how much got imported
-claude-relay db stats
+# LLM を有効化（既定はオフ）
+agents-relay config set reasoning_llm_enabled true
+agents-relay config set reasoning_llm_base_url http://localhost:1234/v1
 ```
 
-On my setup, that came out to about 48 sessions and 75,000 entries.
-
-### Using It from Claude Code
-
-Since it's registered as an MCP tool, you can just ask naturally within a Claude Code session:
-
-- "Tell me what I worked on yesterday"
-- "Find the thing where I fixed OAuth"
-- "What was I doing between March 20th and 23rd?"
-- "Show me my recent sessions"
-
-Under the hood, MCP tools like `memory_search`, `memory_list_sessions`, and `memory_get_session` are being called.
-
-### CLI Usage
-
-There are also management commands for direct human use. Since going through MCP tools eats up tokens, admin tasks are designed to be done via the CLI.
+### Admin CLI
 
 ```bash
-# List sessions
-claude-relay list
-claude-relay list --date 2026-03-23
-
-# Export a session's contents as Markdown
-claude-relay export <session_id>
-claude-relay export --date 2026-03-23
-
-# Reset the DB
-claude-relay db reset
-
-# Run raw SQL (handy during development)
-claude-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
-
-# Manually write an entry (for testing)
-claude-relay write "Test message" --type user
+agents-relay db stats             # 件数・DB 別サイズ
+agents-relay db backfill-fulltext # 過去に切り詰めた本文・CoT を元 JSONL から回収
+agents-relay db export-light      # 軽量コピー生成（持ち出し用）
+agents-relay db rebuild-fts       # FTS 索引の再構築
+agents-relay archive              # 期限切れエントリを無損失 JSONL + Markdown にアーカイブして削除
+agents-relay db restore-archive ~/.agents-relay/archive/2026/01/05.jsonl  # アーカイブから復元
+agents-relay list --date 2026-07-12
+agents-relay export <session_id>
+agents-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
 ```
 
-## Design Notes
+## Configuration
 
-### Store Everything, Filter on Read
-
-I initially planned to store only `user` and `assistant` entries, but then I thought, "Why not just dump everything in and filter with WHERE clauses on read?" So `system`, `progress`, `queue-operation` -- it all goes in. That way, if you later decide you want to look at some piece of data, it's already there.
-
-### No Daemon
-
-I considered running a file-watching daemon (like chokidar), but decided against it. Instead, it does incremental ingestion on the SessionStart hook and on MCP tool invocations. It records a byte offset for "how far we've read" in each JSONL file and only processes new lines.
-
-### Archiving
-
-If you set `retention_days` in the config file (`~/.claude-relay/config.json`), expired data gets exported to Markdown and removed from the DB. The default is 30 days.
+`~/.agents-relay/config.json`:
 
 ```jsonc
 {
-  "retention_days": 30,
-  "archive_dir": "~/.claude-relay/archive"
+  "retention_days": 30,                              // archive の対象になる日数
+  "archive_dir": "~/.agents-relay/archive",
+  "reasoning_llm_enabled": false,                    // consolidate / CoT 要約に LLM を使うか
+  "reasoning_llm_base_url": "http://localhost:1234/v1",
+  "reasoning_llm_model": "",                         // 空なら /v1/models から自動検出
+  "reasoning_llm_timeout_secs": 120
 }
 ```
 
-## Heads Up
+See [SPEC.en.md](SPEC.en.md) for design details.
 
-I threw this together in about 30 minutes. There's barely any testing. It works on my machine (macOS), but I haven't tried it anywhere else.
+## Caveats
 
-If you find a bug or it doesn't work for you, I'd appreciate it if you let me know via [Issues](https://github.com/veltrea/claude-relay/issues).
+Built to run on my own machine (macOS). Other environments are untested.
 
-I'm not accepting PRs. I'm the type to rewrite the entire codebase on a whim, so there's a good chance the original code won't even exist by the time a PR comes in. If you're interested, feel free to fork it and do whatever you want with it. Anyone can build something like this with vibe coding.
+If you find a bug or it doesn't work for you, an [Issue](https://github.com/veltrea/agents-relay/issues) would be appreciated.
+
+PRs are not accepted. I tend to rewrite the whole thing whenever an idea strikes, so your PR's base code probably won't survive. Feel free to fork and do whatever you like.
 
 ## License
 

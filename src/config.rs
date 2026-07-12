@@ -46,8 +46,9 @@ fn default_reasoning_llm_enabled() -> bool {
 }
 
 fn default_reasoning_llm_base_url() -> String {
-    // Mac mini (M4) の LM Studio。詳細は ~/.claude/CLAUDE.md のリモートマシン構成を参照。
-    "http://192.168.1.22:1234/v1".to_string()
+    // LM Studio 等の OpenAI 互換サーバー。既定はローカルホスト。
+    // リモートマシンを使う場合は config set reasoning_llm_base_url で上書きする。
+    "http://localhost:1234/v1".to_string()
 }
 
 fn default_reasoning_llm_model() -> String {

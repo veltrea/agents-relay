@@ -1,4 +1,8 @@
-# claude-relay: Claude Codeのセッション記憶を雑に保存するやつ
+# agents-relay: AI コーディングエージェントのセッション記憶
+
+**Read this in other languages:** [English](README.en.md)
+
+Claude Code と Antigravity のセッション履歴を SQLite に取り込み、MCP ツールとして「過去の記憶」を提供するシングルバイナリです。旧名 claude-relay。マルチエージェント対応にあわせて改名しました。
 
 ## 経緯
 
@@ -6,113 +10,115 @@
 
 1件のツール使用ごとに AI 圧縮リクエストを飛ばす設計、タイムアウトなしの fetch、リトライ戦略の欠如、liveness と readiness の混同、圧縮後に生データを捨てる不可逆な処理 — コンピュータサイエンスの基礎が押さえられていない実装でした。詳しくは[別の記事](https://note.com/veltrea/n/n791d1defada0)に書いています。
 
-Claude API 前提なら問題が表面化しないだけで、ローカル LLM に切り替えた瞬間に全部が致命的になります。フォーク元の修正を試みましたが、設計思想の問題なので部分的なパッチでは直せません。
+で、考えてみたら取り込み時に AI で圧縮する必要なんてそもそもないんですよね。Claude Code は全セッションデータを `~/.claude/projects/` に JSONL で書き出しています。これを SQLite に**無損失で**突っ込んで、要約や圧縮は「あとから・何度でも作り直せる派生物」として扱えばいい。
 
-で、考えてみたら AI で圧縮する必要なんてそもそもないんですよね。Claude Code は全セッションデータを `~/.claude/projects/` に JSONL で書き出しています。これを SQLite に突っ込んで、検索時に Claude 自身の 1M コンテキストで生データを理解させればいい。AI 圧縮もデーモンも要らない。
+そういうわけでゼロから作ったのがこれです。
 
-そういうわけで **claude-relay** をゼロから作りました。
+## 設計原則
 
-## どういうものか
+1. **原本は絶対に失わない。** 取り込みで切り詰めない。削除の前には必ず無損失エクスポート。要約アルゴリズムを将来差し替えても、原本から何度でも再生成できる。
+2. **トークン節約は保存側でなく提示側で行う。** 検索結果には長大データ（思考過程・巨大本文）を含めず、ポインタだけ返す。エージェントが必要と判断したときだけ専用ツールで取りに行く。
+3. **デーモン不要。** MCP ツール呼び出し時にバイトオフセットで差分取り込み。
 
-- Rust 製のシングルバイナリ（約1,600行）
-- MCP サーバーとして Claude Code に接続し、過去のセッションを検索するツールを提供します
-- デーモン不要。セッション開始時やツール呼び出し時に JSONL を差分取り込みします
-- 古いデータは Markdown にアーカイブして SQLite から消す、みたいな運用もできます
+## ストレージ構成（3 層 + 派生物）
+
+| ファイル | 中身 | 消してよいか |
+|---|---|---|
+| `memory.db` | エントリ本体（inline）+ FTS 索引 + 要約 + 事実 | 不可（本体） |
+| `fulltext.db` | 50KB 超の本文の**全文原本** | 消すと全文が失われる |
+| `reasoning.db` | 生 chain-of-thought（thinking）の原本 | 消しても検索は無傷 |
+| `archive/YYYY/MM/DD.jsonl` | アーカイブ済みエントリの無損失原本（追記専用） | 消すと復元不能 |
+| `memory-light.db` | `db export-light` の派生物（持ち出し用） | いつでも再生成可 |
 
 ## インストール
 
 Rust のビルド環境が必要です。
 
 ```bash
-git clone https://github.com/veltrea/claude-relay.git
-cd claude-relay
+git clone https://github.com/veltrea/agents-relay.git
+cd agents-relay
 cargo build --release
 
 # Claude Code の MCP に登録
-claude mcp add --transport stdio --scope user claude-relay -- $(pwd)/target/release/claude-relay serve
+claude mcp add --transport stdio --scope user agents-relay -- $(pwd)/target/release/agents-relay serve
 ```
-
-パスを通したい人は `target/release/claude-relay` を好きな場所にコピーしてください。
 
 ## 使い方
 
-### まず JSONL を取り込む
+### Claude Code / Antigravity から使う
 
-```bash
-# ~/.claude/projects/ 配下の全セッションを取り込み
-claude-relay ingest ~/.claude/projects/
-
-# 特定のファイルだけ
-claude-relay ingest path/to/session.jsonl
-
-# どれくらい入ったか確認
-claude-relay db stats
-```
-
-自分の環境では 48 セッション、75,000 エントリくらいが入りました。
-
-### Claude Code から使う
-
-MCP ツールとして登録してあるので、Claude Code のセッション内で普通に聞けます。
+MCP ツールとして登録すれば、セッション内で普通に聞くだけです。取り込みはツール呼び出し時に自動で走ります。
 
 - 「昨日の作業内容を教えて」
 - 「OAuth 修正した時のやつ探して」
-- 「3月20日から23日の間に何やってた？」
-- 「最近のセッション一覧を見せて」
+- 「このプロジェクトで何を決めたっけ？」（→ `memory_facts` が蒸留済みの決定・制約を返す）
+- 「あのときなぜその設計にした？」（→ `memory_get_reasoning` が当時の思考過程を返す）
 
-裏では `memory_search`、`memory_list_sessions`、`memory_get_session` 等の MCP ツールが呼ばれています。
+主な MCP ツール:
 
-### CLI でも使える
+| ツール | 用途 |
+|---|---|
+| `memory_search` | FTS 全文検索（workspace 名・ブランチ名でも当たる） |
+| `memory_list_sessions` | セッション一覧（蒸留済みなら要約スニペット付き） |
+| `memory_get_session` | セッション全文（要約が先頭に付く） |
+| `memory_get_entry` | 1 エントリの全文（fulltext 原本から） |
+| `memory_get_reasoning` | 保存された思考過程（summary / full） |
+| `memory_facts` | 蒸留済みの持続的事実（低トークン） |
 
-人間が直接叩く管理コマンドもあります。MCP ツール経由だとトークンを食うので、管理系は CLI でやる設計です。
+### 睡眠時整理（要約と事実の蒸留）
+
+終了したセッションをローカル LLM（LM Studio 等 OpenAI 互換 API）で蒸留します。LLM が落ちていれば抽出圧縮にフォールバックし、後から `--upgrade` で格上げできます。
 
 ```bash
-# セッション一覧
-claude-relay list
-claude-relay list --date 2026-03-23
+# 直近の終了セッションを蒸留（要約 + 事実抽出）
+agents-relay consolidate
 
-# セッションの中身を Markdown で出力
-claude-relay export <session_id>
-claude-relay export --date 2026-03-23
+# ヒューリスティック要約を LLM 要約に格上げ
+agents-relay consolidate --upgrade
 
-# DB のリセット
-claude-relay db reset
-
-# 生 SQL も叩ける（開発時に便利）
-claude-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
-
-# テスト用に手動で書き込み
-claude-relay write "テストメッセージ" --type user
+# LLM を有効化（既定はオフ）
+agents-relay config set reasoning_llm_enabled true
+agents-relay config set reasoning_llm_base_url http://localhost:1234/v1
 ```
 
-## 設計の話
+### 管理 CLI
 
-### 全部保存して、読む時に絞る
+```bash
+agents-relay db stats             # 件数・DB 別サイズ
+agents-relay db backfill-fulltext # 過去に切り詰めた本文・CoT を元 JSONL から回収
+agents-relay db export-light      # 軽量コピー生成（持ち出し用）
+agents-relay db rebuild-fts       # FTS 索引の再構築
+agents-relay archive              # 期限切れエントリを無損失 JSONL + Markdown にアーカイブして削除
+agents-relay db restore-archive ~/.agents-relay/archive/2026/01/05.jsonl  # アーカイブから復元
+agents-relay list --date 2026-07-12
+agents-relay export <session_id>
+agents-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
+```
 
-最初は `user` と `assistant` だけ保存しようとしていたんですが、「全部突っ込んで読み出し時に WHERE で絞ればよくない？」と思い直しました。`system`、`progress`、`queue-operation` も全部入れています。後から「やっぱりあのデータ見たい」となっても対応できます。
+## 設定
 
-### デーモン不要
-
-ファイル監視デーモン（chokidar 等）を常駐させる案もありましたが、やめました。SessionStart フックと MCP ツール呼び出し時に差分取り込みする方式にしています。JSONL の「前回どこまで読んだか」をバイトオフセットで記録しておいて、新しい行だけ処理します。
-
-### アーカイブ
-
-設定ファイル（`~/.claude-relay/config.json`）で `retention_days` を指定すると、期限切れのデータを Markdown に書き出して DB から消せます。デフォルトは 30 日です。
+`~/.agents-relay/config.json`:
 
 ```jsonc
 {
-  "retention_days": 30,
-  "archive_dir": "~/.claude-relay/archive"
+  "retention_days": 30,                              // archive の対象になる日数
+  "archive_dir": "~/.agents-relay/archive",
+  "reasoning_llm_enabled": false,                    // consolidate / CoT 要約に LLM を使うか
+  "reasoning_llm_base_url": "http://localhost:1234/v1",
+  "reasoning_llm_model": "",                         // 空なら /v1/models から自動検出
+  "reasoning_llm_timeout_secs": 120
 }
 ```
 
+設計の詳細は [SPEC.md](SPEC.md) を参照してください。
+
 ## 注意事項
 
-30 分くらいで作りました。テストはほとんどやっていません。自分の環境（macOS）では動いていますが、他の環境は試していません。
+自分の環境（macOS）で動かすために作っているものです。他の環境は試していません。
 
-バグを見つけた方、動かなかった方は [Issue](https://github.com/veltrea/claude-relay/issues) で教えてもらえると助かります。
+バグを見つけた方、動かなかった方は [Issue](https://github.com/veltrea/agents-relay/issues) で教えてもらえると助かります。
 
-PR は受け付けていません。思いついたら丸ごとコードを書き換えるタイプなので、PR をもらっても元のコードが残っていない可能性が高いです。気になった方はフォークして自由にやってください。バイブコーディングすれば誰でも作れます。
+PR は受け付けていません。思いついたら丸ごとコードを書き換えるタイプなので、PR をもらっても元のコードが残っていない可能性が高いです。気になった方はフォークして自由にやってください。
 
 ## ライセンス
 

@@ -1,5 +1,47 @@
 # Changelog
 
+**Read this in other languages:** [English](CHANGELOG.en.md)
+
+## [0.2.1] - 2026-07-12
+
+### 無損失 3 層ストレージ
+
+「原本は絶対に失わない。トークン節約は提示側で行う」を原則に、ストレージを 3 層に分離しました。
+
+- 生 CoT（thinking）を `reasoning.db`（`rdb.cot`）に分離。`memory.db` 側は概算トークン数のポインタのみ保持
+- 50KB 超の本文は先頭 1KB + マーカーを inline 保存し、全文を `fulltext.db`（`fdb.fulltext`）へ無損失退避。FTS は inline のみ索引
+- 取り込み時の切り詰め（content 50KB / reasoning 200KB / antigravity 48KB）を全廃し、ポリシーを `db::insert_entry_full` に集約
+- `db backfill-fulltext`: 過去に切り詰められた本文と、旧版が捨てていた thinking を元 JSONL / `.jsonl.bak` から回収（冪等）
+- `db export-light`: CoT・FTS 実体抜きの軽量コピーを一方向生成（持ち出し・バックアップ用。`db rebuild-fts` で完全復元）
+- `archive` は削除前に「全カラム + 生 CoT + 全文原本」の無損失 JSONL を fsync まで書き出す方式に変更（追記専用）
+- `db restore-archive <file.jsonl>`: アーカイブからの冪等復元
+- `db rebuild-fts` が通常の FTS5 テーブルで常に失敗していた問題を修正（`'delete-all'` は contentless 専用のため DROP + CREATE 方式に）
+- 更新時の削除で FTS に幽霊行が残る問題を修正（分離 DB も含めて同期削除）
+
+### 睡眠時整理（consolidate）
+
+- `consolidate`: 終了したセッションをローカル LLM（LM Studio 等 OpenAI 互換）で要約し `summaries` へ保存。LLM 不達時は抽出圧縮にフォールバックし、`--upgrade` で後から LLM 要約に格上げ可能
+- 持続的事実（DECISION / CONSTRAINT / PREFERENCE / ENVIRONMENT）を抽出して `facts` テーブルへ蓄積。文字バイグラム Jaccard >= 0.6 の新規性ゲートで既知の事実を排除、削除ではなく `superseded_by` で失効管理
+- MCP ツール `memory_facts` を追加（蒸留済み事実の検索。生ログ検索よりはるかに低トークン）
+- `memory_list_sessions` に要約スニペット、`memory_get_session` の先頭にセッション要約を付与
+
+### 検索
+
+- FTS に `context` 列（workspace 名 + git branch + source）を追加。プロジェクト名やブランチ名でも過去の記憶を検索可能に（contextual retrieval の軽量版）
+
+### Antigravity 取り込み強化
+
+- `agyhub_summaries_proto.pb`（平文 protobuf・手書き wire format パーサ）から全会話のタイトル・workspace・時刻を取り込み。brain が空のセッションも検索可能に
+- `.system_generated/logs/transcript.jsonl` の増分取り込み（実際の user / assistant / tool ロール付き）
+- `knowledge/<topic>/`（蒸留済みナレッジ）の取り込み
+- アーティファクト変更検知にサイズ + mtime を併用（同サイズ置換の見逃しを解消）
+
+### MCP
+
+- `memory_get_entry` / `memory_get_reasoning` の転送を 200KB でキャップ（DB 内の原本は無損失のまま）
+
+---
+
 ## [0.2.0] - 2026-04-01
 
 ### Breaking Changes

@@ -184,6 +184,11 @@ enum DbAction {
     },
     /// Recover full text of previously-truncated entries from source JSONL files
     BackfillFulltext,
+    /// Restore entries from a lossless archive JSONL (written by `archive`)
+    RestoreArchive {
+        /// Path to a .jsonl file under the archive directory
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -292,6 +297,13 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            DbAction::RestoreArchive { path } => {
+                let (restored, skipped) = export::restore_archive_jsonl(&conn, &path)?;
+                println!("Restored {restored} entries ({skipped} already present, skipped).");
+                if restored > 0 {
+                    println!("Note: run `db rebuild-fts` if search results look incomplete.");
+                }
+            }
         },
 
         Commands::Archive { dry } => {
@@ -327,12 +339,23 @@ fn main() -> Result<()> {
                 }
                 let dir = archive_dir.join(parts[0]).join(parts[1]);
                 let file = dir.join(format!("{}.md", parts[2]));
+                let jsonl_file = dir.join(format!("{}.jsonl", parts[2]));
 
                 if dry {
-                    println!("[dry] Would archive {date} -> {}", file.display());
+                    println!(
+                        "[dry] Would archive {date} -> {} (+ lossless {})",
+                        file.display(),
+                        jsonl_file.display()
+                    );
                 } else {
-                    let md = export::export_date(&conn, date)?;
                     std::fs::create_dir_all(&dir)?;
+
+                    // 無損失 JSONL (全カラム + 生CoT + 全文原本)。削除より先に
+                    // fsync まで完了させる。追記方式なので再実行しても消えない。
+                    let exported = export::append_date_jsonl(&conn, date, &jsonl_file)?;
+
+                    // 人間用の Markdown ダイジェスト
+                    let md = export::export_date(&conn, date)?;
                     // クラッシュ後の再実行で二重書き出しにならないよう冪等化
                     if !file.exists() {
                         std::fs::write(&file, &md)?;
@@ -354,7 +377,11 @@ fn main() -> Result<()> {
                         rusqlite::params![date],
                     )?;
                     tx.commit()?;
-                    println!("Archived {date} -> {}", file.display());
+                    println!(
+                        "Archived {date}: {exported} entries -> {} (lossless) + {} (digest)",
+                        jsonl_file.display(),
+                        file.display()
+                    );
                 }
             }
 

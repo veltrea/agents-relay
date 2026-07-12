@@ -1,5 +1,6 @@
 mod client;
 mod config;
+mod consolidate;
 mod db;
 mod detect;
 mod export;
@@ -38,6 +39,25 @@ enum Commands {
     Db {
         #[command(subcommand)]
         action: DbAction,
+    },
+
+    /// Distill finished sessions into summaries and durable facts (sleep-time consolidation)
+    Consolidate {
+        /// Max sessions to process per run
+        #[arg(long, default_value = "20")]
+        limit: i64,
+        /// Skip sessions with fewer user/assistant entries than this
+        #[arg(long, default_value = "6")]
+        min_entries: i64,
+        /// Only process sessions idle for at least this many minutes
+        #[arg(long, default_value = "60")]
+        idle_mins: i64,
+        /// Skip fact extraction (summaries only)
+        #[arg(long)]
+        no_facts: bool,
+        /// Also re-process sessions whose summary was made without the LLM
+        #[arg(long)]
+        upgrade: bool,
     },
 
     /// Archive old entries to Markdown
@@ -307,6 +327,21 @@ fn main() -> Result<()> {
             }
         },
 
+        Commands::Consolidate { limit, min_entries, idle_mins, no_facts, upgrade } => {
+            let cfg = config::Config::load()?;
+            let stats = consolidate::run(&mut conn, &cfg, limit, min_entries, idle_mins, !no_facts, upgrade)?;
+            println!(
+                "Consolidated {} sessions ({} via LLM). Facts: +{} added, {} duplicates skipped.",
+                stats.sessions, stats.llm_summaries, stats.facts_added, stats.facts_skipped
+            );
+            if stats.sessions > 0 && stats.llm_summaries == 0 && cfg.reasoning_llm_enabled {
+                println!("Note: LLM unreachable — summaries used heuristic fallback. Re-run later to upgrade.");
+            }
+            if !cfg.reasoning_llm_enabled {
+                println!("Note: reasoning_llm_enabled=false — heuristic summaries only, no fact extraction.\n      Enable with: agents-relay config set reasoning_llm_enabled true");
+            }
+        }
+
         Commands::Archive { dry } => {
             let cfg = config::Config::load()?;
             let cutoff = chrono::Utc::now()
@@ -387,11 +422,7 @@ fn main() -> Result<()> {
             }
 
             if !dry {
-                conn.execute_batch(
-                    "DELETE FROM raw_entries_fts;
-                     INSERT INTO raw_entries_fts (rowid, content, tool_name, session_id)
-                     SELECT id, content, tool_name, session_id FROM raw_entries;",
-                )?;
+                db::rebuild_fts(&conn)?;
                 println!("FTS index rebuilt.");
             }
         }

@@ -83,7 +83,24 @@ pub fn summarize_best(raw: &str, llm: Option<&LlmConfig>) -> Summary {
 /// 専用 OS スレッドに隔離し、クライアントの生成〜drop を非 tokio 文脈で完結させる。
 /// (offline CLI からの呼び出しでも追加スレッド 1 本で動作は同じ。)
 fn summarize_llm(raw: &str, cfg: &LlmConfig) -> Result<String> {
-    let raw = raw.to_string();
+    let input = truncate_chars(raw.trim(), LLM_INPUT_MAX_CHARS);
+    // max_tokens を入力サイズに連動させ、暴走(繰り返しループ)の出力長を抑える。
+    // 要約は入力の半分以下を狙う。下限 96 / 上限 512 トークン。
+    let max_tokens = (estimate_tokens(&input) / 2).clamp(96, 512);
+    chat_llm(
+        LLM_SYSTEM_PROMPT,
+        &format!("Compress this chain-of-thought:\n\n{input}"),
+        cfg,
+        max_tokens,
+    )
+}
+
+/// OpenAI 互換 chat/completions を 1 回呼ぶ汎用ヘルパー。
+/// summarize_llm のスレッド隔離 (tokio 文脈での blocking クライアント drop 対策) を
+/// そのまま引き継ぐ。
+fn chat_llm(system: &str, user: &str, cfg: &LlmConfig, max_tokens: i64) -> Result<String> {
+    let system = system.to_string();
+    let user = user.to_string();
     let base = cfg.base_url.trim_end_matches('/').to_string();
     let model_cfg = cfg.model.clone();
     let timeout = cfg.timeout_secs;
@@ -95,15 +112,11 @@ fn summarize_llm(raw: &str, cfg: &LlmConfig) -> Result<String> {
             model_cfg
         };
 
-        let input = truncate_chars(raw.trim(), LLM_INPUT_MAX_CHARS);
-        // max_tokens を入力サイズに連動させ、暴走(繰り返しループ)の出力長を抑える。
-        // 要約は入力の半分以下を狙う。下限 96 / 上限 512 トークン。
-        let max_tokens = (estimate_tokens(&input) / 2).clamp(96, 512);
         let body = json!({
             "model": model,
             "messages": [
-                { "role": "system", "content": LLM_SYSTEM_PROMPT },
-                { "role": "user", "content": format!("Compress this chain-of-thought:\n\n{input}") }
+                { "role": "system", "content": system },
+                { "role": "user", "content": user }
             ],
             "temperature": 0.2,
             "max_tokens": max_tokens,
@@ -135,6 +148,79 @@ fn summarize_llm(raw: &str, cfg: &LlmConfig) -> Result<String> {
     })
     .join()
     .map_err(|_| anyhow!("summarize worker thread panicked"))?
+}
+
+/// セッション要約用のシステムプロンプト。
+const SESSION_SUMMARY_PROMPT: &str = "You summarize a work session between a user and an AI coding agent. \
+Output 3-10 concise bullet points covering: the goal, key decisions and their reasons, \
+what was built or changed, verification results, and unresolved issues or next steps. \
+Write in the language predominantly used in the session (Japanese sessions get Japanese summaries). \
+No preamble, no headers — just the bullets.";
+
+/// セッション全体のダイジェストを要約する。LLM 優先・ヒューリスティックにフォールバック。
+pub fn summarize_session_best(digest: &str, llm: Option<&LlmConfig>) -> Summary {
+    if let Some(cfg) = llm {
+        if cfg.enabled {
+            let input = truncate_chars(digest.trim(), LLM_INPUT_MAX_CHARS);
+            match chat_llm(
+                SESSION_SUMMARY_PROMPT,
+                &format!("Summarize this session:\n\n{input}"),
+                cfg,
+                512,
+            ) {
+                Ok(s) if !s.trim().is_empty() && estimate_tokens(&s) <= estimate_tokens(digest) => {
+                    return Summary { text: s.trim().to_string(), used_llm: true };
+                }
+                Ok(_) => {
+                    eprintln!("agents-relay: LLM session summary unusable, using heuristic");
+                }
+                Err(e) => {
+                    eprintln!("agents-relay: LLM session summary failed ({e}), using heuristic");
+                }
+            }
+        }
+    }
+    Summary { text: summarize(digest), used_llm: false }
+}
+
+/// 事実抽出用のシステムプロンプト。1 行 1 事実の固定形式で出させる。
+const FACT_EXTRACT_PROMPT: &str = "Extract durable facts from this work session that will still matter in future sessions. \
+Only include: decisions made (and why), constraints discovered, user preferences expressed, \
+and environment facts (paths, hosts, tool versions, gotchas). \
+Exclude: one-off actions, transient states, anything obvious from reading the code. \
+Output one fact per line in the exact format 'CATEGORY: fact text' where CATEGORY is one of \
+DECISION, CONSTRAINT, PREFERENCE, ENVIRONMENT. Keep each fact self-contained and under 200 characters. \
+Write facts in the language predominantly used in the session. \
+If there is nothing durable, output exactly 'NONE'.";
+
+/// セッションダイジェストから持続的な事実を抽出する (LLM 必須・フォールバックなし)。
+/// 戻り値: (カテゴリ, 事実) のリスト。
+pub fn extract_facts_llm(digest: &str, cfg: &LlmConfig) -> Result<Vec<(String, String)>> {
+    let input = truncate_chars(digest.trim(), LLM_INPUT_MAX_CHARS);
+    let out = chat_llm(
+        FACT_EXTRACT_PROMPT,
+        &format!("Extract durable facts from this session:\n\n{input}"),
+        cfg,
+        512,
+    )?;
+
+    let mut facts = Vec::new();
+    for line in out.lines() {
+        let line = line.trim().trim_start_matches(['-', '*', ' ']);
+        if line.is_empty() || line.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        if let Some((cat, fact)) = line.split_once(':') {
+            let cat = cat.trim().to_uppercase();
+            let fact = fact.trim();
+            if ["DECISION", "CONSTRAINT", "PREFERENCE", "ENVIRONMENT"].contains(&cat.as_str())
+                && !fact.is_empty()
+            {
+                facts.push((cat, fact.to_string()));
+            }
+        }
+    }
+    Ok(facts)
 }
 
 /// /v1/models からロード済みモデル id を取得する (ゼロ設定用)。

@@ -330,13 +330,21 @@ fn handle_tool(
             let sessions = db::list_sessions(conn, date, limit, workspace)?;
             let result: Vec<Value> = sessions
                 .iter()
-                .map(|(sid, first, last, d, count)| json!({
-                    "session_id": sid,
-                    "first_timestamp": first,
-                    "last_timestamp": last,
-                    "date": d,
-                    "entry_count": count,
-                }))
+                .map(|(sid, first, last, d, count)| {
+                    let mut obj = json!({
+                        "session_id": sid,
+                        "first_timestamp": first,
+                        "last_timestamp": last,
+                        "date": d,
+                        "entry_count": count,
+                    });
+                    // consolidate 済みならセッション要約の先頭を添える
+                    if let Ok(Some(summary)) = db::get_summary(conn, sid) {
+                        let text = strip_summarizer_marker(&summary);
+                        obj["summary"] = json!(truncate_chars_srv(text, 300));
+                    }
+                    obj
+                })
                 .collect();
             Ok(serde_json::to_string_pretty(&result)?)
         }
@@ -361,7 +369,7 @@ fn handle_tool(
                 anyhow::bail!("Provide session_id or date/date_from/date_to");
             };
 
-            let result: Vec<Value> = entries
+            let mut result: Vec<Value> = entries
                 .iter()
                 .map(|e| {
                     let mut obj = json!({
@@ -377,6 +385,39 @@ fn handle_tool(
                     add_reasoning_pointer(&mut obj, e.reasoning_tokens);
                     obj
                 })
+                .collect();
+            // セッション指定なら、consolidate 済み要約を先頭に付ける
+            if let Some(sid) = session_id {
+                if let Ok(Some(summary)) = db::get_summary(conn, sid) {
+                    result.insert(0, json!({
+                        "type": "session_summary",
+                        "session_id": sid,
+                        "content": strip_summarizer_marker(&summary),
+                    }));
+                }
+            }
+            Ok(serde_json::to_string_pretty(&result)?)
+        }
+
+        // consolidate が蓄積した持続的事実 (決定・制約・好み・環境) を検索する
+        "memory_facts" => {
+            let query = args.get("query").and_then(|q| q.as_str()).unwrap_or("");
+            let ws_filter = args.get("workspace").and_then(|w| w.as_str()).or(workspace);
+            let limit = args.get("limit")
+                .and_then(|l| l.as_i64().or_else(|| l.as_f64().map(|f| f as i64)))
+                .unwrap_or(20);
+
+            let facts = db::search_facts(conn, query, ws_filter, limit)?;
+            let result: Vec<Value> = facts
+                .iter()
+                .map(|(id, category, fact, ws, sid, created)| json!({
+                    "id": id,
+                    "category": category,
+                    "fact": fact,
+                    "workspace": ws,
+                    "session_id": sid,
+                    "created_at": created,
+                }))
                 .collect();
             Ok(serde_json::to_string_pretty(&result)?)
         }
@@ -509,6 +550,29 @@ fn format_entries(entries: &[db::RawEntry]) -> Vec<Value> {
 
 /// 検索/セッション結果に CoT ポインタを付与する。
 /// 本文は含めず、has_reasoning と概算トークン数のみ。これでデフォルトのトークン消費を抑える。
+/// summaries の summary_md 先頭にある `<!-- summarizer: ... -->` マーカーを剥がす
+fn strip_summarizer_marker(summary: &str) -> &str {
+    if let Some(rest) = summary.strip_prefix("<!--") {
+        if let Some(end) = rest.find("-->") {
+            return rest[end + 3..].trim_start();
+        }
+    }
+    summary
+}
+
+/// マルチバイト境界を壊さずに文字数で切り詰める (表示用)
+fn truncate_chars_srv(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// MCP レスポンスに載せる content の上限 (bytes)。fdb の全文原本は数 MB に
 /// なりうるため、呼び出し側エージェントのコンテキストを守る目的で転送だけ切る。
 const TRANSPORT_CONTENT_MAX: usize = 200_000;

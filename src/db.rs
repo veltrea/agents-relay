@@ -93,7 +93,7 @@ pub fn init(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_raw_date ON raw_entries(date);
         CREATE INDEX IF NOT EXISTS idx_raw_type ON raw_entries(type);
         CREATE VIRTUAL TABLE IF NOT EXISTS raw_entries_fts USING fts5(
-            content, tool_name, session_id
+            content, tool_name, session_id, context
         );
 
         CREATE TABLE IF NOT EXISTS sync_state (
@@ -110,6 +110,21 @@ pub fn init(conn: &Connection) -> Result<()> {
             ended_at TEXT,
             summary_md TEXT NOT NULL,
             created_at TEXT DEFAULT (datetime('now'))
+        );
+
+        -- 持続的な事実 (決定・制約・好み・環境)。consolidate が抽出して蓄積する。
+        -- 削除はせず superseded_by で失効させる (bi-temporal の軽量版)。
+        CREATE TABLE IF NOT EXISTS facts (
+            id INTEGER PRIMARY KEY,
+            category TEXT NOT NULL,
+            fact TEXT NOT NULL,
+            workspace TEXT,
+            session_id TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            superseded_by INTEGER
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+            fact, category, workspace
         );
         ",
     )?;
@@ -171,23 +186,52 @@ fn migrate(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_raw_cwd ON raw_entries(cwd);"
     )?;
 
+    // FTS に context 列 (workspace 名 + branch + source) がなければ再構築。
+    // プロジェクト名やブランチ名でも過去の記憶を検索できるようにするため
+    // (contextual retrieval の軽量版)。53万行で 20 秒程度の一回きりの処理。
+    let fts_has_context: bool = conn
+        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='raw_entries_fts'")?
+        .query_row([], |row| row.get::<_, String>(0))
+        .map(|sql| sql.contains("context"))
+        .unwrap_or(true);
+    if !fts_has_context {
+        eprintln!("Migration: rebuilding FTS index with context column (one-time, ~20s)...");
+        rebuild_fts(conn)?;
+        eprintln!("Migration: FTS context rebuild done");
+    }
+
     Ok(())
 }
+
+/// FTS の context 列: workspace 名 (cwd の basename)・branch・source を検索語彙に載せる。
+/// 本文には混ぜない (snippet や get_entry の内容を汚さないため)。
+fn fts_context(cwd: Option<&str>, git_branch: Option<&str>, source: &str) -> String {
+    let ws = cwd
+        .map(|c| c.trim_end_matches('/'))
+        .and_then(|c| c.rsplit('/').next())
+        .unwrap_or("");
+    format!("{} {} {}", ws, git_branch.unwrap_or(""), source)
+        .trim()
+        .to_string()
+}
+
+/// rebuild_fts 内で context を SQL 側で計算する式 (fts_context と同じ内容)
+const FTS_CONTEXT_SQL: &str = "trim(COALESCE(substr(rtrim(cwd, '/'), length(rtrim(rtrim(cwd, '/'), replace(rtrim(cwd, '/'), '/', ''))) + 1), '') || ' ' || COALESCE(git_branch, '') || ' ' || source)";
 
 /// FTS インデックスを安全に再構築する（delete-all + rebuild）
 pub fn rebuild_fts(conn: &Connection) -> Result<()> {
     // 'delete-all' は contentless/external-content FTS5 専用のため、
     // 通常の FTS5 テーブルでは DROP → 再作成で全再構築する
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "
         DROP TABLE IF EXISTS raw_entries_fts;
         CREATE VIRTUAL TABLE raw_entries_fts USING fts5(
-            content, tool_name, session_id
+            content, tool_name, session_id, context
         );
-        INSERT INTO raw_entries_fts(rowid, content, tool_name, session_id)
-            SELECT id, content, tool_name, session_id FROM raw_entries;
+        INSERT INTO raw_entries_fts(rowid, content, tool_name, session_id, context)
+            SELECT id, content, tool_name, session_id, {FTS_CONTEXT_SQL} FROM raw_entries;
         ",
-    )?;
+    ))?;
     Ok(())
 }
 
@@ -300,9 +344,9 @@ pub fn insert_entry_full(
 
     // FTS に同期（inline content のみ。reasoning / 全文原本は意図的にインデックスしない）
     conn.execute(
-        "INSERT INTO raw_entries_fts (rowid, content, tool_name, session_id)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![id, inline, tool_name, session_id],
+        "INSERT INTO raw_entries_fts (rowid, content, tool_name, session_id, context)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, inline, tool_name, session_id, fts_context(cwd, git_branch, source)],
     )?;
 
     Ok(id)
@@ -336,6 +380,192 @@ pub fn set_sync_offset(conn: &Connection, file_path: &str, offset: i64) -> Resul
         params![file_path, offset],
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// summaries / facts (睡眠時整理 consolidate 用)
+// ---------------------------------------------------------------------------
+
+/// セッション要約を UPSERT する
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_summary(
+    conn: &Connection,
+    session_id: &str,
+    project_path: Option<&str>,
+    git_branch: Option<&str>,
+    started_at: &str,
+    ended_at: &str,
+    summary_md: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO summaries (session_id, project_path, git_branch, started_at, ended_at, summary_md)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id) DO UPDATE SET
+             project_path = ?2, git_branch = ?3, started_at = ?4, ended_at = ?5, summary_md = ?6",
+        params![session_id, project_path, git_branch, started_at, ended_at, summary_md],
+    )?;
+    Ok(())
+}
+
+pub fn get_summary(conn: &Connection, session_id: &str) -> Result<Option<String>> {
+    let s = conn
+        .query_row(
+            "SELECT summary_md FROM summaries WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(s)
+}
+
+/// 要約が必要なセッション (未要約、または要約後に新しいエントリが増えたもの) を返す。
+/// upgrade_heuristic=true なら、ヒューリスティック要約のままのセッションも
+/// 再処理対象に含める (LLM が使えるようになった後の格上げ用)。
+/// 戻り値: (session_id, started, ended, entry_count)
+pub fn sessions_needing_summary(
+    conn: &Connection,
+    min_entries: i64,
+    idle_cutoff: &str,
+    limit: i64,
+    upgrade_heuristic: bool,
+) -> Result<Vec<(String, String, String, i64)>> {
+    let upgrade_clause = if upgrade_heuristic {
+        "OR EXISTS (SELECT 1 FROM summaries s2 WHERE s2.session_id = r.session_id
+                    AND s2.summary_md LIKE '<!-- summarizer: heuristic -->%')"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT r.session_id, MIN(r.timestamp), MAX(r.timestamp), COUNT(*)
+         FROM raw_entries r
+         WHERE r.type IN ('user', 'assistant')
+         GROUP BY r.session_id
+         HAVING COUNT(*) >= ?1
+            AND MAX(r.timestamp) <= ?2
+            AND (MAX(r.timestamp) > COALESCE(
+                (SELECT s.ended_at FROM summaries s WHERE s.session_id = r.session_id), '')
+                {upgrade_clause})
+         ORDER BY MAX(r.timestamp) DESC
+         LIMIT ?3"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![min_entries, idle_cutoff, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 文字バイグラム Jaccard 類似度 (0.0-1.0)。日本語にも頑健な軽量類似判定。
+pub fn bigram_similarity(a: &str, b: &str) -> f64 {
+    fn bigrams(s: &str) -> std::collections::HashSet<(char, char)> {
+        let chars: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
+        chars.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+    let (sa, sb) = (bigrams(a), bigrams(b));
+    if sa.is_empty() || sb.is_empty() {
+        return if a.trim() == b.trim() { 1.0 } else { 0.0 };
+    }
+    let inter = sa.intersection(&sb).count() as f64;
+    let union = sa.union(&sb).count() as f64;
+    inter / union
+}
+
+/// 新規性ゲート: 既存の有効な事実に類似するものがあればその id を返す。
+/// 類似度は文字バイグラム Jaccard >= 0.6 で「既知」とみなす。
+pub fn find_duplicate_fact(conn: &Connection, fact: &str) -> Result<Option<i64>> {
+    let mut stmt =
+        conn.prepare("SELECT id, fact FROM facts WHERE superseded_by IS NULL")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, existing) = row?;
+        if bigram_similarity(fact, &existing) >= 0.6 {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+pub fn insert_fact(
+    conn: &Connection,
+    category: &str,
+    fact: &str,
+    workspace: Option<&str>,
+    session_id: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO facts (category, fact, workspace, session_id) VALUES (?1, ?2, ?3, ?4)",
+        params![category, fact, workspace, session_id],
+    )?;
+    let id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO facts_fts (rowid, fact, category, workspace) VALUES (?1, ?2, ?3, ?4)",
+        params![id, fact, category, workspace],
+    )?;
+    Ok(id)
+}
+
+/// 事実の検索。query が空なら新しい順に一覧。
+/// 戻り値: (id, category, fact, workspace, session_id, created_at)
+pub fn search_facts(
+    conn: &Connection,
+    query: &str,
+    workspace: Option<&str>,
+    limit: i64,
+) -> Result<Vec<(i64, String, String, Option<String>, Option<String>, String)>> {
+    let trimmed = query.trim();
+    let mut out = Vec::new();
+
+    let (sql, use_query) = if trimmed.is_empty() || trimmed == "*" {
+        (
+            "SELECT f.id, f.category, f.fact, f.workspace, f.session_id, f.created_at
+             FROM facts f
+             WHERE f.superseded_by IS NULL
+               AND (?1 IS NULL OR f.workspace = ?1 OR f.workspace IS NULL)
+             ORDER BY f.id DESC LIMIT ?2"
+                .to_string(),
+            false,
+        )
+    } else {
+        (
+            "SELECT f.id, f.category, f.fact, f.workspace, f.session_id, f.created_at
+             FROM facts_fts t
+             JOIN facts f ON f.id = t.rowid
+             WHERE facts_fts MATCH ?3 AND f.superseded_by IS NULL
+               AND (?1 IS NULL OR f.workspace = ?1 OR f.workspace IS NULL)
+             ORDER BY rank LIMIT ?2"
+                .to_string(),
+            true,
+        )
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let map = |row: &rusqlite::Row| -> rusqlite::Result<_> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    };
+    if use_query {
+        let fts_query = normalize_fts_query(trimmed);
+        let rows = stmt.query_map(params![workspace, limit, fts_query], map)?;
+        for r in rows {
+            out.push(r?);
+        }
+    } else {
+        let rows = stmt.query_map(params![workspace, limit], map)?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    Ok(out)
 }
 
 /// 持ち出し・バックアップ用の軽量コピーを一方向生成する。
@@ -401,7 +631,7 @@ pub fn export_light(conn: &Connection, out: &Path) -> Result<i64> {
             INSERT INTO light.summaries SELECT * FROM summaries;
 
             CREATE VIRTUAL TABLE light.raw_entries_fts USING fts5(
-                content, tool_name, session_id
+                content, tool_name, session_id, context
             );
             ",
         )?;

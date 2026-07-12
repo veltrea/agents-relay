@@ -223,6 +223,49 @@ pub fn extract_facts_llm(digest: &str, cfg: &LlmConfig) -> Result<Vec<(String, S
     Ok(facts)
 }
 
+/// OpenAI 互換 /embeddings でテキスト群を埋め込みベクトルにする。
+/// LM Studio は埋め込みモデル (bge-m3 等) を JIT ロードして応答する。
+pub fn embed_texts(
+    texts: &[String],
+    model: &str,
+    base_url: &str,
+    timeout_secs: u64,
+) -> Result<Vec<Vec<f32>>> {
+    let texts = texts.to_vec();
+    let model = model.to_string();
+    let base = base_url.trim_end_matches('/').to_string();
+
+    std::thread::spawn(move || -> Result<Vec<Vec<f32>>> {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(timeout_secs))
+            .build()?;
+        let resp = client
+            .post(format!("{base}/embeddings"))
+            .json(&json!({ "model": model, "input": texts }))
+            .send()?
+            .error_for_status()?
+            .json::<Value>()?;
+
+        let data = resp["data"]
+            .as_array()
+            .ok_or_else(|| anyhow!("no data in embeddings response"))?;
+        let mut out = Vec::with_capacity(data.len());
+        for item in data {
+            let emb: Vec<f32> = item["embedding"]
+                .as_array()
+                .ok_or_else(|| anyhow!("no embedding in response item"))?
+                .iter()
+                .filter_map(|v| v.as_f64().map(|f| f as f32))
+                .collect();
+            out.push(emb);
+        }
+        Ok(out)
+    })
+    .join()
+    .map_err(|_| anyhow!("embedding worker thread panicked"))?
+}
+
 /// /v1/models からロード済みモデル id を取得する (ゼロ設定用)。
 /// 互換のため複数のレスポンス形に対応:
 ///   - OpenAI / LM Studio: {"data":[{"id":...}]}

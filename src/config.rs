@@ -8,6 +8,9 @@ pub struct Config {
     pub retention_days: u32,
     #[serde(default = "default_archive_dir")]
     pub archive_dir: String,
+    /// db backup の出力先。別物理ディスクを指定するのが望ましい。
+    #[serde(default = "default_backup_dir")]
+    pub backup_dir: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
     /// CoT 要約に LLM (LM Studio 等 OpenAI 互換 API) を使うか。既定 false（opt-in）。
@@ -23,6 +26,10 @@ pub struct Config {
     /// LLM 呼び出しの合計タイムアウト秒。
     #[serde(default = "default_reasoning_llm_timeout_secs")]
     pub reasoning_llm_timeout_secs: u64,
+    /// 意味検索用の埋め込みモデル名 (OpenAI 互換 /embeddings)。
+    /// 空なら意味検索は無効。API は reasoning_llm_base_url を共用する。
+    #[serde(default = "default_embedding_model")]
+    pub embedding_model: String,
 }
 
 fn default_retention_days() -> u32 {
@@ -37,6 +44,14 @@ fn default_archive_dir() -> String {
         .to_string()
 }
 
+fn default_backup_dir() -> String {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".agents-relay")
+        .join("backups")
+        .to_string_lossy()
+        .to_string()
+}
+
 fn default_enabled() -> bool {
     true
 }
@@ -47,6 +62,7 @@ fn default_reasoning_llm_enabled() -> bool {
 
 fn default_reasoning_llm_base_url() -> String {
     // LM Studio 等の OpenAI 互換サーバー。既定はローカルホスト。
+    // リモートマシンを使う場合は config set reasoning_llm_base_url で上書きする。
     "http://localhost:1234/v1".to_string()
 }
 
@@ -58,16 +74,22 @@ fn default_reasoning_llm_timeout_secs() -> u64 {
     30
 }
 
+fn default_embedding_model() -> String {
+    String::new()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             retention_days: default_retention_days(),
             archive_dir: default_archive_dir(),
+            backup_dir: default_backup_dir(),
             enabled: default_enabled(),
             reasoning_llm_enabled: default_reasoning_llm_enabled(),
             reasoning_llm_base_url: default_reasoning_llm_base_url(),
             reasoning_llm_model: default_reasoning_llm_model(),
             reasoning_llm_timeout_secs: default_reasoning_llm_timeout_secs(),
+            embedding_model: default_embedding_model(),
         }
     }
 }
@@ -114,6 +136,9 @@ impl Config {
             "archive_dir" => {
                 self.archive_dir = value.to_string();
             }
+            "backup_dir" => {
+                self.backup_dir = value.to_string();
+            }
             "enabled" => {
                 self.enabled = match value {
                     "true" | "1" | "yes" => true,
@@ -137,6 +162,9 @@ impl Config {
             "reasoning_llm_timeout_secs" => {
                 self.reasoning_llm_timeout_secs = value.parse()?;
             }
+            "embedding_model" => {
+                self.embedding_model = value.to_string();
+            }
             _ => {
                 anyhow::bail!("Unknown config key: {key}");
             }
@@ -151,18 +179,22 @@ impl Config {
              enabled:                    {}\n\
              retention_days:             {}\n\
              archive_dir:                {}\n\
+             backup_dir:                 {}\n\
              reasoning_llm_enabled:      {}\n\
              reasoning_llm_base_url:     {}\n\
              reasoning_llm_model:        {}\n\
-             reasoning_llm_timeout_secs: {}",
+             reasoning_llm_timeout_secs: {}\n\
+             embedding_model:            {}",
             Self::config_path().display(),
             self.enabled,
             self.retention_days,
             self.archive_dir,
+            self.backup_dir,
             self.reasoning_llm_enabled,
             self.reasoning_llm_base_url,
             if self.reasoning_llm_model.is_empty() { "(auto-detect)" } else { &self.reasoning_llm_model },
-            self.reasoning_llm_timeout_secs
+            self.reasoning_llm_timeout_secs,
+            if self.embedding_model.is_empty() { "(disabled)" } else { &self.embedding_model }
         )
     }
 }
@@ -170,5 +202,10 @@ impl Config {
 /// DB パスを expand して返す
 pub fn resolve_archive_dir(config: &Config) -> PathBuf {
     let expanded = shellexpand::tilde(&config.archive_dir);
+    PathBuf::from(expanded.as_ref())
+}
+
+pub fn resolve_backup_dir(config: &Config) -> PathBuf {
+    let expanded = shellexpand::tilde(&config.backup_dir);
     PathBuf::from(expanded.as_ref())
 }

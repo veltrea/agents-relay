@@ -1,119 +1,138 @@
-# claude-relay: Claude Codeのセッション記憶を雑に保存するやつ
+# agents-relay: Session Memory for AI Coding Agents
 
-## 経緯
+**Read this in other languages:** [日本語](README.ja.md)
 
-[claude-mem](https://github.com/anthropics/claude-mem)（Claude Code のセッション記憶プラグイン）をローカル LLM で使えるようにしようとフォークしてソースコードを読んだところ、正直なところ使い物になりませんでした。
+A single binary that ingests Claude Code and Antigravity session history into SQLite and serves "past memory" as MCP tools. Formerly claude-relay; renamed when it went multi-agent.
 
-1件のツール使用ごとに AI 圧縮リクエストを飛ばす設計、タイムアウトなしの fetch、リトライ戦略の欠如、liveness と readiness の混同、圧縮後に生データを捨てる不可逆な処理 — コンピュータサイエンスの基礎が押さえられていない実装でした。詳しくは[別の記事](https://note.com/veltrea/n/n791d1defada0)に書いています。
+## Background
 
-Claude API 前提なら問題が表面化しないだけで、ローカル LLM に切り替えた瞬間に全部が致命的になります。フォーク元の修正を試みましたが、設計思想の問題なので部分的なパッチでは直せません。
+I forked [claude-mem](https://github.com/anthropics/claude-mem) (a session memory plugin for Claude Code) intending to make it work with local LLMs, but after reading through the source code, I honestly found it unusable.
 
-で、考えてみたら AI で圧縮する必要なんてそもそもないんですよね。Claude Code は全セッションデータを `~/.claude/projects/` に JSONL で書き出しています。これを SQLite に突っ込んで、検索時に Claude 自身の 1M コンテキストで生データを理解させればいい。AI 圧縮もデーモンも要らない。
+Firing an AI compression request per tool use, fetches without timeouts, no retry strategy, confusing liveness with readiness, and irreversibly discarding raw data after compression — the fundamentals of computer science just weren't there. I wrote more about it in [a separate article](https://note.com/veltrea/n/n791d1defada0).
 
-そういうわけで **claude-relay** をゼロから作りました。
+Then it hit me: there is no reason to compress with AI at ingest time in the first place. Claude Code already writes every session to `~/.claude/projects/` as JSONL. Load that into SQLite **losslessly**, and treat summaries and compression as derived artifacts you can regenerate at any time.
 
-## どういうものか
+So I built this from scratch.
 
-- Rust 製のシングルバイナリ（約1,600行）
-- MCP サーバーとして Claude Code に接続し、過去のセッションを検索するツールを提供します
-- デーモン不要。セッション開始時やツール呼び出し時に JSONL を差分取り込みします
-- 古いデータは Markdown にアーカイブして SQLite から消す、みたいな運用もできます
+## Design principles
 
-## インストール
+1. **Never lose the original.** No truncation at ingest. Every deletion is preceded by a lossless export. Swap the summarization algorithm later and regenerate everything from the originals.
+2. **Save tokens on the presentation side, not the storage side.** Search results carry pointers instead of bulky data (chains of thought, huge bodies). Agents fetch the full data with a dedicated tool only when they decide they need it.
+3. **No daemons.** Incremental ingest by byte offset whenever an MCP tool is called.
 
-Rust のビルド環境が必要です。
+## Storage layout (three tiers + derived artifacts)
+
+| File | Contents | Safe to delete? |
+|---|---|---|
+| `memory.db` | Entry bodies (inline) + FTS index + summaries + facts | No (the core) |
+| `fulltext.db` | **Full original text** of bodies over 50KB | Deleting loses full texts |
+| `reasoning.db` | Raw chain-of-thought (thinking) originals | Search survives deletion |
+| `archive/YYYY/MM/DD.jsonl` | Lossless originals of archived entries (append-only) | Deleting loses restore data |
+| `vectors.db` | Embedding vectors of summaries/facts (semantic search) | Regenerable via `embed` |
+| `memory-light.db` | Derived output of `db export-light` (for transport) | Regenerable anytime |
+
+## Install
+
+Requires a Rust build environment.
 
 ```bash
-git clone https://github.com/veltrea/claude-relay.git
-cd claude-relay
+git clone https://github.com/veltrea/agents-relay.git
+cd agents-relay
 cargo build --release
 
-# Claude Code の MCP に登録
-claude mcp add --transport stdio --scope user claude-relay -- $(pwd)/target/release/claude-relay serve
+# Register with Claude Code as an MCP server
+claude mcp add --transport stdio --scope user agents-relay -- $(pwd)/target/release/agents-relay serve
 ```
 
-パスを通したい人は `target/release/claude-relay` を好きな場所にコピーしてください。
+## Usage
 
-## 使い方
+### From Claude Code / Antigravity
 
-### まず JSONL を取り込む
+Register it as an MCP server and just ask inside a session. Ingest runs automatically on tool calls.
+
+- "What did I work on yesterday?"
+- "Find the session where we fixed OAuth"
+- "What did we decide in this project?" (→ `memory_facts` returns distilled decisions and constraints)
+- "Why did we choose that design back then?" (→ `memory_get_reasoning` returns the chain of thought from that moment)
+
+Main MCP tools:
+
+| Tool | Purpose |
+|---|---|
+| `memory_search` | FTS full-text search (also matches workspace and branch names) |
+| `memory_list_sessions` | Session list (with summary snippets once consolidated) |
+| `memory_get_session` | Full session history (session summary prepended) |
+| `memory_get_entry` | Full text of one entry (from the fulltext originals) |
+| `memory_get_reasoning` | Stored chain of thought (summary / full) |
+| `memory_facts` | Distilled durable facts (very low token cost) |
+
+### Sleep-time consolidation (distilling summaries and facts)
+
+Finished sessions are distilled with a local LLM (LM Studio or any OpenAI-compatible API). If the LLM is unreachable, it falls back to extractive compression, upgradeable later with `--upgrade`.
 
 ```bash
-# ~/.claude/projects/ 配下の全セッションを取り込み
-claude-relay ingest ~/.claude/projects/
+# Distill recently finished sessions (summary + fact extraction)
+agents-relay consolidate
 
-# 特定のファイルだけ
-claude-relay ingest path/to/session.jsonl
+# Upgrade heuristic summaries to LLM summaries
+agents-relay consolidate --upgrade
 
-# どれくらい入ったか確認
-claude-relay db stats
+# Enable the LLM (off by default)
+agents-relay config set reasoning_llm_enabled true
+agents-relay config set reasoning_llm_base_url http://localhost:1234/v1
 ```
 
-自分の環境では 48 セッション、75,000 エントリくらいが入りました。
+### Semantic search (hybrid retrieval)
 
-### Claude Code から使う
-
-MCP ツールとして登録してあるので、Claude Code のセッション内で普通に聞けます。
-
-- 「昨日の作業内容を教えて」
-- 「OAuth 修正した時のやつ探して」
-- 「3月20日から23日の間に何やってた？」
-- 「最近のセッション一覧を見せて」
-
-裏では `memory_search`、`memory_list_sessions`、`memory_get_session` 等の MCP ツールが呼ばれています。
-
-### CLI でも使える
-
-人間が直接叩く管理コマンドもあります。MCP ツール経由だとトークンを食うので、管理系は CLI でやる設計です。
+FTS5 handles Japanese poorly (no word segmentation), so rephrased queries miss. Once an embedding model (e.g. bge-m3) is configured, `memory_search` augments FTS results with semantic neighbors from summaries and facts.
 
 ```bash
-# セッション一覧
-claude-relay list
-claude-relay list --date 2026-03-23
-
-# セッションの中身を Markdown で出力
-claude-relay export <session_id>
-claude-relay export --date 2026-03-23
-
-# DB のリセット
-claude-relay db reset
-
-# 生 SQL も叩ける（開発時に便利）
-claude-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
-
-# テスト用に手動で書き込み
-claude-relay write "テストメッセージ" --type user
+agents-relay config set embedding_model text-embedding-bge-m3
+agents-relay embed   # embed existing summaries/facts (consolidate embeds new ones automatically)
 ```
 
-## 設計の話
+### Admin CLI
 
-### 全部保存して、読む時に絞る
+```bash
+agents-relay db stats             # counts and per-database sizes
+agents-relay db backup            # consistent snapshot of the 3 DBs to backup_dir (with rotation)
+agents-relay db backfill-fulltext # recover truncated bodies / CoT from source JSONL
+agents-relay db export-light      # generate a lightweight copy (for transport)
+agents-relay db rebuild-fts       # rebuild the FTS index
+agents-relay archive              # archive expired entries to lossless JSONL + Markdown, then delete
+agents-relay db restore-archive ~/.agents-relay/archive/2026/01/05.jsonl  # restore from an archive
+agents-relay list --date 2026-07-12
+agents-relay export <session_id>
+agents-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
+```
 
-最初は `user` と `assistant` だけ保存しようとしていたんですが、「全部突っ込んで読み出し時に WHERE で絞ればよくない？」と思い直しました。`system`、`progress`、`queue-operation` も全部入れています。後から「やっぱりあのデータ見たい」となっても対応できます。
+## Configuration
 
-### デーモン不要
-
-ファイル監視デーモン（chokidar 等）を常駐させる案もありましたが、やめました。SessionStart フックと MCP ツール呼び出し時に差分取り込みする方式にしています。JSONL の「前回どこまで読んだか」をバイトオフセットで記録しておいて、新しい行だけ処理します。
-
-### アーカイブ
-
-設定ファイル（`~/.claude-relay/config.json`）で `retention_days` を指定すると、期限切れのデータを Markdown に書き出して DB から消せます。デフォルトは 30 日です。
+`~/.agents-relay/config.json`:
 
 ```jsonc
 {
-  "retention_days": 30,
-  "archive_dir": "~/.claude-relay/archive"
+  "retention_days": 30,                              // days before entries become archive targets
+  "archive_dir": "~/.agents-relay/archive",
+  "reasoning_llm_enabled": false,                    // use the LLM for consolidate / CoT summaries
+  "reasoning_llm_base_url": "http://localhost:1234/v1",
+  "reasoning_llm_model": "",                         // empty = auto-detect via /v1/models
+  "reasoning_llm_timeout_secs": 120,
+  "backup_dir": "~/.agents-relay/backups",           // output dir for db backup (separate disk recommended)
+  "embedding_model": ""                              // embedding model for semantic search (empty = disabled)
 }
 ```
 
-## 注意事項
+See [SPEC.md](SPEC.md) for design details.
 
-30 分くらいで作りました。テストはほとんどやっていません。自分の環境（macOS）では動いていますが、他の環境は試していません。
+## Caveats
 
-バグを見つけた方、動かなかった方は [Issue](https://github.com/veltrea/claude-relay/issues) で教えてもらえると助かります。
+Built to run on my own machine (macOS). Other environments are untested.
 
-PR は受け付けていません。思いついたら丸ごとコードを書き換えるタイプなので、PR をもらっても元のコードが残っていない可能性が高いです。気になった方はフォークして自由にやってください。バイブコーディングすれば誰でも作れます。
+If you find a bug or it doesn't work for you, an [Issue](https://github.com/veltrea/agents-relay/issues) would be appreciated.
 
-## ライセンス
+PRs are not accepted. I tend to rewrite the whole thing whenever an idea strikes, so your PR's base code probably won't survive. Feel free to fork and do whatever you like.
+
+## License
 
 MIT License

@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::sync::{Arc, atomic::{AtomicI32, Ordering}};
 use tokio::sync::Mutex;
 
-use crate::{client::DEFAULT_PORT, config::Config, db, ingest};
+use crate::{config::Config, db, ingest};
 
 #[derive(Clone)]
 struct AppState {
@@ -68,7 +68,7 @@ fn any_serve_alive() -> bool {
 
 #[tokio::main]
 pub async fn run() -> Result<()> {
-    let port = DEFAULT_PORT;
+    let port = crate::client::default_port();
 
     // すでに起動中なら終了
     if let Ok(resp) = reqwest::get(format!("http://127.0.0.1:{port}/health")).await {
@@ -232,7 +232,14 @@ fn handle_tool(
                 conn, query, date, date_from, date_to, entry_type, session_id, limit,
                 workspace, source,
             )?;
-            Ok(serde_json::to_string_pretty(&format_entries(&entries))?)
+            let mut result = format_entries(&entries);
+
+            // 意味検索: 埋め込みが有効なら、蒸留済み要約・事実からも近傍を引いて
+            // 追記する。FTS が言い回しの違いで取りこぼすものを補完する。
+            // 埋め込みサービス不達時は静かに FTS のみとなる。
+            result.extend(semantic_hits(conn, query));
+
+            Ok(serde_json::to_string_pretty(&result)?)
         }
 
         "memory_get_entry" => {
@@ -550,6 +557,79 @@ fn format_entries(entries: &[db::RawEntry]) -> Vec<Value> {
 
 /// 検索/セッション結果に CoT ポインタを付与する。
 /// 本文は含めず、has_reasoning と概算トークン数のみ。これでデフォルトのトークン消費を抑える。
+/// 意味検索: クエリを埋め込み、要約・事実の近傍を返す。
+/// 埋め込み無効・サービス不達・索引未生成のときは空を返す (検索自体は FTS で成立)。
+fn semantic_hits(conn: &rusqlite::Connection, query: &str) -> Vec<Value> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() || trimmed == "*" {
+        return Vec::new();
+    }
+    let cfg = Config::load().unwrap_or_default();
+    if cfg.embedding_model.is_empty() {
+        return Vec::new();
+    }
+    // 索引が未生成なら何もしない
+    if !matches!(db::vec_state(conn), Ok(Some(_))) {
+        return Vec::new();
+    }
+    let emb = match crate::reasoning::embed_texts(
+        &[trimmed.to_string()],
+        &cfg.embedding_model,
+        &cfg.reasoning_llm_base_url,
+        10, // クエリ埋め込みは検索の体感を守るため短いタイムアウト
+    ) {
+        Ok(mut v) if !v.is_empty() => v.remove(0),
+        _ => return Vec::new(),
+    };
+
+    let mut out = Vec::new();
+
+    if let Ok(hits) = db::vec_search(conn, "vec_summaries", &emb, 3) {
+        for (id, distance) in hits {
+            let row: Option<(String, String)> = conn
+                .query_row(
+                    "SELECT session_id, summary_md FROM summaries WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .ok();
+            if let Some((session_id, summary)) = row {
+                out.push(json!({
+                    "match": "semantic",
+                    "kind": "session_summary",
+                    "session_id": session_id,
+                    "content": truncate_chars_srv(strip_summarizer_marker(&summary), 300),
+                    "distance": (distance * 1000.0).round() / 1000.0,
+                }));
+            }
+        }
+    }
+
+    if let Ok(hits) = db::vec_search(conn, "vec_facts", &emb, 3) {
+        for (id, distance) in hits {
+            let row: Option<(String, String, Option<String>)> = conn
+                .query_row(
+                    "SELECT category, fact, workspace FROM facts WHERE id = ?1 AND superseded_by IS NULL",
+                    rusqlite::params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .ok();
+            if let Some((category, fact, ws)) = row {
+                out.push(json!({
+                    "match": "semantic",
+                    "kind": "fact",
+                    "category": category,
+                    "content": fact,
+                    "workspace": ws,
+                    "distance": (distance * 1000.0).round() / 1000.0,
+                }));
+            }
+        }
+    }
+
+    out
+}
+
 /// summaries の summary_md 先頭にある `<!-- summarizer: ... -->` マーカーを剥がす
 fn strip_summarizer_marker(summary: &str) -> &str {
     if let Some(rest) = summary.strip_prefix("<!--") {

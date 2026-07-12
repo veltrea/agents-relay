@@ -1,8 +1,16 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-/// agents-relay server のデフォルトポート (antigravity-relay の 54321 と被らないよう 54322)
+/// agents-relay server のデフォルトポート (antigravity-relay の 54321 と被らないよう 54322)。
+/// テスト・並行環境用に AGENTS_RELAY_PORT 環境変数で上書きできる。
 pub const DEFAULT_PORT: u16 = 54322;
+
+pub fn default_port() -> u16 {
+    std::env::var("AGENTS_RELAY_PORT")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(DEFAULT_PORT)
+}
 
 fn port_file_path() -> std::path::PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -13,7 +21,7 @@ pub fn read_server_port() -> u16 {
     std::fs::read_to_string(port_file_path())
         .ok()
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(DEFAULT_PORT)
+        .unwrap_or_else(default_port)
 }
 
 fn health_url(port: u16) -> String {

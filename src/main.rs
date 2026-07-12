@@ -6,6 +6,7 @@ mod export;
 mod ingest;
 mod ingest_antigravity;
 mod mcp;
+mod reasoning;
 mod server;
 mod session_hook;
 mod workspace;
@@ -175,6 +176,14 @@ enum DbAction {
     Vacuum,
     /// Rebuild FTS index (use if search is broken)
     RebuildFts,
+    /// Export a lightweight copy (no chain-of-thought, no FTS payload)
+    ExportLight {
+        /// Output path (default: memory-light.db next to memory.db)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Recover full text of previously-truncated entries from source JSONL files
+    BackfillFulltext,
 }
 
 #[derive(Subcommand)]
@@ -264,6 +273,25 @@ fn main() -> Result<()> {
                 db::rebuild_fts(&conn)?;
                 println!("FTS index rebuilt.");
             }
+            DbAction::ExportLight { out } => {
+                let out = out.unwrap_or_else(|| db_path.with_file_name("memory-light.db"));
+                let count = db::export_light(&conn, &out)?;
+                let size_mb = std::fs::metadata(&out).map(|m| m.len() / 1_048_576).unwrap_or(0);
+                println!(
+                    "Exported {count} entries -> {} ({size_mb} MB)\n\
+                     Note: FTS index is empty. To search on the copy, run `db rebuild-fts` against it.",
+                    out.display()
+                );
+            }
+            DbAction::BackfillFulltext => {
+                let (filled, remaining) = ingest::backfill_fulltext(&mut conn)?;
+                println!("Backfilled {filled} entries into fulltext.db.");
+                if remaining > 0 {
+                    println!(
+                        "{remaining} truncated entries remain (source files no longer available)."
+                    );
+                }
+            }
         },
 
         Commands::Archive { dry } => {
@@ -311,6 +339,16 @@ fn main() -> Result<()> {
                     }
                     // ファイル書き出し完了後にトランザクションで削除（BUG-004修正）
                     let tx = conn.transaction()?;
+                    tx.execute(
+                        "DELETE FROM rdb.cot WHERE entry_id IN
+                             (SELECT id FROM raw_entries WHERE date = ?1)",
+                        rusqlite::params![date],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM fdb.fulltext WHERE entry_id IN
+                             (SELECT id FROM raw_entries WHERE date = ?1)",
+                        rusqlite::params![date],
+                    )?;
                     tx.execute(
                         "DELETE FROM raw_entries WHERE date = ?1",
                         rusqlite::params![date],
@@ -557,12 +595,52 @@ fn main() -> Result<()> {
                     let entries =
                         db::get_session_entries(&conn, sid, None, limit.unwrap_or(50))?;
                     for e in &entries {
-                        println!("[{}] {} {}: {}", e.id, e.time, e.entry_type, e.content);
+                        let ptr = e.reasoning_tokens
+                            .filter(|t| *t > 0)
+                            .map(|t| format!(" [has_reasoning ~{t}tok]"))
+                            .unwrap_or_default();
+                        println!("[{}] {} {}: {}{}", e.id, e.time, e.entry_type, e.content, ptr);
+                    }
+                }
+                // mode は query 引数で指定（"full" で生 CoT、それ以外は summary）
+                "memory_get_reasoning" => {
+                    let entry_id = id.unwrap_or(0);
+                    let mode = query.as_deref().unwrap_or("summary");
+                    match db::get_entry(&conn, entry_id)? {
+                        Some(e) => match e.reasoning {
+                            None => println!("id={entry_id}: no chain-of-thought stored."),
+                            Some(raw) => {
+                                if mode == "full" {
+                                    println!("id={entry_id} mode=full ({:?} tok)\n{raw}", e.reasoning_tokens);
+                                } else {
+                                    let (summary, kind) = match e.reasoning_summary {
+                                        Some(s) => (s, "cached"),
+                                        None => {
+                                            let c = config::Config::load().unwrap_or_default();
+                                            let llm = reasoning::LlmConfig {
+                                                enabled: c.reasoning_llm_enabled,
+                                                base_url: c.reasoning_llm_base_url,
+                                                model: c.reasoning_llm_model,
+                                                timeout_secs: c.reasoning_llm_timeout_secs,
+                                            };
+                                            let r = reasoning::summarize_best(&raw, Some(&llm));
+                                            db::set_reasoning_summary(&conn, entry_id, &r.text).ok();
+                                            (r.text, if r.used_llm { "llm" } else { "heuristic" })
+                                        }
+                                    };
+                                    println!(
+                                        "id={entry_id} mode=summary summarizer={kind} (summary~{}tok / full {:?}tok)\n{summary}",
+                                        reasoning::estimate_tokens(&summary), e.reasoning_tokens
+                                    );
+                                }
+                            }
+                        },
+                        None => println!("Not found."),
                     }
                 }
                 _ => {
                     println!("Unknown tool: {name}");
-                    println!("Available: memory_search, memory_get_entry, memory_get_session");
+                    println!("Available: memory_search, memory_get_entry, memory_get_session, memory_get_reasoning");
                     println!("Tip: use 'agents-relay list' for session listing.");
                 }
             }

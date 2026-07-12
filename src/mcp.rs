@@ -315,6 +315,19 @@ fn tool_definitions(scope: &ServerScope) -> Value {
         }
     }));
 
+    tools.push(json!({
+        "name": "memory_get_reasoning",
+        "description": "Fetch the stored chain-of-thought (reasoning) for ONE past memory entry by id. Search and session results deliberately omit reasoning to save tokens — they only flag it with has_reasoning=true and reasoning_tokens. Call this ONLY when you specifically need the reasoning behind a past entry (e.g. 'why did it decide that'). mode='summary' (default) returns a compressed version; mode='full' returns the raw CoT, which can be large.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id":   { "type": "number", "description": "Entry id from a search/session result where has_reasoning=true" },
+                "mode": { "type": "string", "description": "'summary' (default, compressed) or 'full' (raw CoT)" }
+            },
+            "required": ["id"]
+        }
+    }));
+
     // Antigravity 専用ツール
     if scope.client == "antigravity" || scope.default_source.as_deref() == Some("antigravity") {
         tools.push(json!({

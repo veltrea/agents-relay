@@ -10,6 +10,19 @@ pub struct Config {
     pub archive_dir: String,
     #[serde(default = "default_enabled")]
     pub enabled: bool,
+    /// CoT 要約に LLM (LM Studio 等 OpenAI 互換 API) を使うか。既定 false（opt-in）。
+    /// false の場合は LLM 不使用のヒューリスティック圧縮を使う。
+    #[serde(default = "default_reasoning_llm_enabled")]
+    pub reasoning_llm_enabled: bool,
+    /// OpenAI 互換 API のベース URL（末尾 /v1 まで）。
+    #[serde(default = "default_reasoning_llm_base_url")]
+    pub reasoning_llm_base_url: String,
+    /// 使用モデル名。空文字なら /v1/models から自動検出する。
+    #[serde(default = "default_reasoning_llm_model")]
+    pub reasoning_llm_model: String,
+    /// LLM 呼び出しの合計タイムアウト秒。
+    #[serde(default = "default_reasoning_llm_timeout_secs")]
+    pub reasoning_llm_timeout_secs: u64,
 }
 
 fn default_retention_days() -> u32 {
@@ -28,12 +41,33 @@ fn default_enabled() -> bool {
     true
 }
 
+fn default_reasoning_llm_enabled() -> bool {
+    false
+}
+
+fn default_reasoning_llm_base_url() -> String {
+    // Mac mini (M4) の LM Studio。詳細は ~/.claude/CLAUDE.md のリモートマシン構成を参照。
+    "http://192.168.1.22:1234/v1".to_string()
+}
+
+fn default_reasoning_llm_model() -> String {
+    String::new()
+}
+
+fn default_reasoning_llm_timeout_secs() -> u64 {
+    30
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
             retention_days: default_retention_days(),
             archive_dir: default_archive_dir(),
             enabled: default_enabled(),
+            reasoning_llm_enabled: default_reasoning_llm_enabled(),
+            reasoning_llm_base_url: default_reasoning_llm_base_url(),
+            reasoning_llm_model: default_reasoning_llm_model(),
+            reasoning_llm_timeout_secs: default_reasoning_llm_timeout_secs(),
         }
     }
 }
@@ -87,6 +121,22 @@ impl Config {
                     _ => anyhow::bail!("Invalid value for enabled: {value} (use true/false)"),
                 };
             }
+            "reasoning_llm_enabled" => {
+                self.reasoning_llm_enabled = match value {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => anyhow::bail!("Invalid value for reasoning_llm_enabled: {value} (use true/false)"),
+                };
+            }
+            "reasoning_llm_base_url" => {
+                self.reasoning_llm_base_url = value.to_string();
+            }
+            "reasoning_llm_model" => {
+                self.reasoning_llm_model = value.to_string();
+            }
+            "reasoning_llm_timeout_secs" => {
+                self.reasoning_llm_timeout_secs = value.parse()?;
+            }
             _ => {
                 anyhow::bail!("Unknown config key: {key}");
             }
@@ -98,13 +148,21 @@ impl Config {
     pub fn show(&self) -> String {
         format!(
             "Config file: {}\n\
-             enabled:        {}\n\
-             retention_days: {}\n\
-             archive_dir:    {}",
+             enabled:                    {}\n\
+             retention_days:             {}\n\
+             archive_dir:                {}\n\
+             reasoning_llm_enabled:      {}\n\
+             reasoning_llm_base_url:     {}\n\
+             reasoning_llm_model:        {}\n\
+             reasoning_llm_timeout_secs: {}",
             Self::config_path().display(),
             self.enabled,
             self.retention_days,
-            self.archive_dir
+            self.archive_dir,
+            self.reasoning_llm_enabled,
+            self.reasoning_llm_base_url,
+            if self.reasoning_llm_model.is_empty() { "(auto-detect)" } else { &self.reasoning_llm_model },
+            self.reasoning_llm_timeout_secs
         )
     }
 }

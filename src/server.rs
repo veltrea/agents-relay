@@ -227,10 +227,12 @@ fn handle_tool(
             let limit = args.get("limit")
                 .and_then(|l| l.as_i64().or_else(|| l.as_f64().map(|f| f as i64)))
                 .unwrap_or(20);
+            // deep=true: 表層 (surface FTS) で当たらないツール出力本体まで全文 LIKE で探す。
+            let deep = args.get("deep").and_then(|d| d.as_bool()).unwrap_or(false);
 
             let entries = db::search(
                 conn, query, date, date_from, date_to, entry_type, session_id, limit,
-                workspace, source,
+                workspace, source, deep,
             )?;
             let mut result = format_entries(&entries);
 

@@ -268,6 +268,7 @@ fn tool_definitions(scope: &ServerScope) -> Value {
                 "type": "object",
                 "properties": {
                     "query":      { "type": "string", "description": "FTS search query" },
+                    "deep":       { "type": "boolean", "description": "Default false. false = search the conversation surface only (prose + tool-call targets + errors); tool output bodies are excluded to cut noise. Set true to also scan full tool output bodies (slower, substring match) — use only when hunting a string that lived inside a tool result." },
                     "date":       { "type": "string", "description": "Filter by date (YYYY-MM-DD)" },
                     "date_from":  { "type": "string", "description": "Date range start" },
                     "date_to":    { "type": "string", "description": "Date range end" },

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 
 /// sqlite-vec 拡張を全コネクションに登録する（プロセスごとに一度だけ）
@@ -294,6 +294,12 @@ pub fn init(conn: &Connection) -> Result<()> {
         CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
             fact, category, workspace
         );
+
+        -- スキーマ/索引レシピの版管理 (FTS を surface 投影に張り替えた等)。
+        CREATE TABLE IF NOT EXISTS meta (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         ",
     )?;
 
@@ -361,22 +367,38 @@ fn migrate(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_raw_cwd ON raw_entries(cwd);"
     )?;
 
-    // FTS に context 列 (workspace 名 + branch + source) がなければ再構築。
-    // プロジェクト名やブランチ名でも過去の記憶を検索できるようにするため
-    // (contextual retrieval の軽量版)。53万行で 20 秒程度の一回きりの処理。
+    // FTS 索引を surface 投影ベースに保つ。以下のいずれかで一回きり再構築する:
+    //   - context 列が無い旧スキーマ (workspace/branch 検索の追加)
+    //   - 索引レシピが最新でない (本文全文 → surface 投影への切替など)
+    // surface 投影は成功ツール出力の本体を索引しない = 検索からノイズを排除する。
+    // 53万行で 1〜2 分程度の一回きりの処理。以後は取り込み時に surface で索引される。
     let fts_has_context: bool = conn
         .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='raw_entries_fts'")?
         .query_row([], |row| row.get::<_, String>(0))
         .map(|sql| sql.contains("context"))
         .unwrap_or(true);
-    if !fts_has_context {
-        eprintln!("Migration: rebuilding FTS index with context column (one-time, ~20s)...");
+    let fts_recipe: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'fts_recipe'", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?;
+    if !fts_has_context || fts_recipe.as_deref() != Some(FTS_RECIPE) {
+        eprintln!("Migration: rebuilding FTS as surface projection (one-time, ~1-2min)...");
         rebuild_fts(conn)?;
-        eprintln!("Migration: FTS context rebuild done");
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('fts_recipe', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = ?1",
+            params![FTS_RECIPE],
+        )?;
+        eprintln!("Migration: FTS surface rebuild done");
     }
 
     Ok(())
 }
+
+/// FTS 索引レシピの版。surface 投影で索引していることを示す。
+/// 索引の作り方 (投影) を変えたらこの値を上げると一回きり再構築される。
+const FTS_RECIPE: &str = "surface_v1";
 
 /// FTS の context 列: workspace 名 (cwd の basename)・branch・source を検索語彙に載せる。
 /// 本文には混ぜない (snippet や get_entry の内容を汚さないため)。
@@ -390,23 +412,51 @@ fn fts_context(cwd: Option<&str>, git_branch: Option<&str>, source: &str) -> Str
         .to_string()
 }
 
-/// rebuild_fts 内で context を SQL 側で計算する式 (fts_context と同じ内容)
-const FTS_CONTEXT_SQL: &str = "trim(COALESCE(substr(rtrim(cwd, '/'), length(rtrim(rtrim(cwd, '/'), replace(rtrim(cwd, '/'), '/', ''))) + 1), '') || ' ' || COALESCE(git_branch, '') || ' ' || source)";
-
-/// FTS インデックスを安全に再構築する（delete-all + rebuild）
+/// FTS インデックスを surface 投影で再構築する（DROP → 再作成 → 全行索引）。
+/// 索引本文には content の全文ではなく `compact::surface`（散文は全保持・成功ツール
+/// 出力の本体は畳む・エラーは残す）を載せる。これで検索からツール出力ノイズを排除しつつ
+/// 会話の表層と tool_use の対象（ファイル名/コマンド等）は検索可能に保つ。
+/// 全文原本 (fdb 退避分含む) を読むので、詳細を検索したいときは search(deep=true) で
+/// LIKE フォールバックする。メモリ節約のためストリーミングで処理する。
 pub fn rebuild_fts(conn: &Connection) -> Result<()> {
     // 'delete-all' は contentless/external-content FTS5 専用のため、
-    // 通常の FTS5 テーブルでは DROP → 再作成で全再構築する
-    conn.execute_batch(&format!(
-        "
-        DROP TABLE IF EXISTS raw_entries_fts;
-        CREATE VIRTUAL TABLE raw_entries_fts USING fts5(
-            content, tool_name, session_id, context
-        );
-        INSERT INTO raw_entries_fts(rowid, content, tool_name, session_id, context)
-            SELECT id, content, tool_name, session_id, {FTS_CONTEXT_SQL} FROM raw_entries;
-        ",
-    ))?;
+    // 通常の FTS5 テーブルでは DROP → 再作成で全再構築する。
+    conn.execute_batch(
+        "DROP TABLE IF EXISTS raw_entries_fts;
+         CREATE VIRTUAL TABLE raw_entries_fts USING fts5(
+             content, tool_name, session_id, context
+         );",
+    )?;
+
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut sel = tx.prepare(
+            "SELECT r.id, r.type, r.tool_name, COALESCE(f.content, r.content),
+                    r.session_id, r.cwd, r.git_branch, r.source
+             FROM raw_entries r
+             LEFT JOIN fdb.fulltext f ON f.entry_id = r.id",
+        )?;
+        let mut ins = tx.prepare(
+            "INSERT INTO raw_entries_fts (rowid, content, tool_name, session_id, context)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        let mut rows = sel.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let entry_type: String = row.get(1)?;
+            let tool_name: Option<String> = row.get(2)?;
+            let content: String = row.get(3)?;
+            let session_id: String = row.get(4)?;
+            let cwd: Option<String> = row.get(5)?;
+            let git_branch: Option<String> = row.get(6)?;
+            let source: String = row.get(7)?;
+
+            let body = crate::compact::surface(&entry_type, tool_name.as_deref(), &content);
+            let ctx = fts_context(cwd.as_deref(), git_branch.as_deref(), &source);
+            ins.execute(params![id, body, tool_name, session_id, ctx])?;
+        }
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -526,11 +576,14 @@ pub fn insert_entry_full(
         )?;
     }
 
-    // FTS に同期（inline content のみ。reasoning / 全文原本は意図的にインデックスしない）
+    // FTS には surface 投影を載せる（散文は全保持・成功ツール出力の本体は畳む・
+    // エラーは残す）。全文 content から作るので overflow でも表層は失われない。
+    // reasoning / 全文原本 / ツール出力本体は意図的にインデックスしない。
+    let fts_body = crate::compact::surface(entry_type, tool_name, content);
     conn.execute(
         "INSERT INTO raw_entries_fts (rowid, content, tool_name, session_id, context)
          VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id, inline, tool_name, session_id, fts_context(cwd, git_branch, source)],
+        params![id, fts_body, tool_name, session_id, fts_context(cwd, git_branch, source)],
     )?;
 
     Ok(id)
@@ -959,6 +1012,7 @@ fn normalize_fts_query(query: &str) -> String {
 
 /// FTS 検索（クエリが空や "*" の場合は FTS を使わず直接検索）
 /// workspace: Some("path") でそのワークスペースのcwdフィルタ、None で全件
+#[allow(clippy::too_many_arguments)]
 pub fn search(
     conn: &Connection,
     query: &str,
@@ -970,9 +1024,16 @@ pub fn search(
     limit: i64,
     workspace: Option<&str>,
     source: Option<&str>,
+    deep: bool,
 ) -> Result<Vec<RawEntry>> {
     let trimmed = query.trim();
-    let use_fts = !trimmed.is_empty() && trimmed != "*";
+    let has_query = !trimmed.is_empty() && trimmed != "*";
+    // 既定 (deep=false): surface 索引の FTS = 会話の表層で検索。
+    // deep=true: 全文原本 (ツール出力本体含む) に LIKE フォールバック。
+    // 「表層で当てて詳細を辿る」既定 + 「出力の中の文字列も探す」逃げ道。
+    let use_fts = has_query && !deep;
+    let use_like = has_query && deep;
+    let joined = use_fts || use_like; // r. プレフィックス (JOIN) が要るか
 
     let mut sql;
     let mut param_idx;
@@ -992,6 +1053,23 @@ pub fn search(
         let fts_query = normalize_fts_query(trimmed);
         param_values.push(Box::new(fts_query));
         param_idx = 2;
+    } else if use_like {
+        // ディープ検索: surface 索引に載らないツール出力本体も含めて全文を走査する。
+        // FTS を使わない素の LIKE なので低速だが、明示オプトイン時のみの逃げ道。
+        sql = String::from(
+            "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type,
+                    r.tool_name, substr(COALESCE(f.content, r.content), 1, 200) as content,
+                    r.cwd, r.git_branch, r.source, r.reasoning_tokens, r.content_tokens
+             FROM raw_entries r
+             LEFT JOIN fdb.fulltext f ON f.entry_id = r.id
+             WHERE COALESCE(f.content, r.content) LIKE ?1 ESCAPE '\\'",
+        );
+        let escaped = trimmed
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        param_values.push(Box::new(format!("%{escaped}%")));
+        param_idx = 2;
     } else {
         sql = String::from(
             "SELECT id, session_id, timestamp, date, time, type,
@@ -1003,9 +1081,9 @@ pub fn search(
         param_idx = 1;
     }
 
-    // FTS時は r. プレフィックス（JOINのエイリアス）、非FTS時はプレフィックスなし
+    // JOIN 時は r. プレフィックス（エイリアス）、素の raw_entries 走査時はプレフィックスなし
     let col = |name: &str| -> String {
-        if use_fts { format!("r.{name}") } else { name.to_string() }
+        if joined { format!("r.{name}") } else { name.to_string() }
     };
 
     if let Some(d) = date {

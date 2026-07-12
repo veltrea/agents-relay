@@ -30,7 +30,8 @@ All under `~/.agents-relay/`. `db::open()` ATTACHes the four side databases into
 ### 3.1 memory.db (core)
 
 - `raw_entries` — entry bodies. `content` holds the **inline representation** (see below); `reasoning_tokens` is the CoT pointer.
-- `raw_entries_fts` — FTS5 index (`content`, `tool_name`, `session_id`, `context`). `context` is "workspace basename + git branch + source", enabling search by project name. Only inline content is indexed.
+- `raw_entries_fts` — FTS5 index (`content`, `tool_name`, `session_id`, `context`). `context` is "workspace basename + git branch + source", enabling search by project name. The indexed `content` is the **surface projection** (`compact::surface`), not the raw body: prose is kept in full, `tool_use` collapses to name + target, successful `tool_result` bodies collapse to a `[result: N lines, M bytes]` stub, and error results are kept in full. This keeps the conversation searchable while excluding tool-output noise (which is ~97% of an agent's bytes). Rebuilt on upgrade, tracked by `meta.fts_recipe`.
+- `meta` — key/value schema & index-recipe markers (e.g. `fts_recipe = surface_v1` triggers a one-time FTS rebuild when the projection changes).
 - `summaries` — session summaries produced by consolidate. `summary_md` starts with a `<!-- summarizer: llm|heuristic -->` marker.
 - `facts` — durable facts. `category` (DECISION / CONSTRAINT / PREFERENCE / ENVIRONMENT), `superseded_by` (expiry instead of deletion). Searched via `facts_fts`.
 - `sync_state` — ingested byte offsets / change-detection stamps (two keys: `<path>` and `<path>#mtime`).
@@ -118,7 +119,7 @@ Deployment separates responsibilities: a KeepAlive daemon runs `consolidate --wa
 
 | Tool | Summary |
 |---|---|
-| `memory_search` | FTS search. scope=self/cross/all (cross/all gated behind user approval) |
+| `memory_search` | FTS search over the conversation surface. `deep=true` adds a full-body substring (`LIKE`) fallback for strings that live inside tool output. scope=self/cross/all (cross/all gated behind user approval) |
 | `memory_list_sessions` | Session list + summary snippets |
 | `memory_get_session` | Session history (summary prepended). `detail` selects the tier: gist (summary only) / min (default, skeleton) / mid / full; each message carries a `tokens` menu `{min,mid,full}`. Default type filter: user,assistant |
 | `memory_get_entry` | Full text of one entry (fulltext originals; transport-capped) |

@@ -696,8 +696,9 @@ fn main() -> Result<()> {
                         None,
                         session_id.as_deref(),
                         limit.unwrap_or(20),
-                        None, // workspace
-                        None, // source
+                        None,  // workspace
+                        None,  // source
+                        false, // deep (CLI 既定は表層検索)
                     )?;
                     for e in &entries {
                         let preview: String = e.content.chars().take(120).collect();

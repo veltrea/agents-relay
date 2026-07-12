@@ -2,6 +2,20 @@
 
 **Read this in other languages:** [日本語](CHANGELOG.ja.md)
 
+## [0.2.3] - 2026-07-13
+
+### Surface-only search index (search the conversation, drill down to detail)
+
+Measured on the production DB, chain-of-thought is only ~0.5% of what an agent generates in a coding session, while tool payloads (`tool_use` + `tool_result`) are ~97%. So the search index was dominated by tool output — a listing whose filenames happen to contain your query term shouldn't rank as a memory of the conversation. The full-text index now stores the **conversation surface** instead of raw bodies.
+
+- New `compact::surface` projection, used only for the FTS index: **prose is kept in full** (no truncation — search terms are never lost), `tool_use` collapses to name + target (`[Read /x/db.rs]`), successful `tool_result` bodies collapse to a `[result: N lines, M bytes]` stub, and **error results are kept in full** (they are what you search for)
+- `raw_entries_fts` is now built from `surface` at ingest and on rebuild; on upgrade it is rebuilt once, tracked by a new `meta` table (`fts_recipe = surface_v1`)
+- `memory_search` gains a `deep` parameter (default false): the default searches the surface only; `deep=true` scans full tool-output bodies via a substring (`LIKE`) fallback — slower, for when you are hunting a string that lived inside a tool result
+- Measured on the production DB (560k entries): indexed text 507MB → 222MB (2.3×); a tool-output-only token (`drwxr-xr-x`) drops from 2,688 default-search hits to 99 (96% of that noise removed), while `deep=true` recovers all 2,688; conversational terms are unaffected. One-time rebuild ~25s
+- Fully derived: the index is regenerated from the originals, which are never touched
+
+---
+
 ## [0.2.2] - 2026-07-13
 
 ### Compact conversation projections (token-frugal session replay)

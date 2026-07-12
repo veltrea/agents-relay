@@ -30,7 +30,8 @@ serve (MCP stdio)                       ──┘
 ### 3.1 memory.db（本体）
 
 - `raw_entries` — エントリ本体。`content` は **inline 表現**（後述）。`reasoning_tokens` は CoT ポインタ。
-- `raw_entries_fts` — FTS5 索引（`content`, `tool_name`, `session_id`, `context`）。`context` は「workspace 名（cwd の basename）+ git branch + source」で、プロジェクト名検索を可能にする。索引対象は inline のみ。
+- `raw_entries_fts` — FTS5 索引（`content`, `tool_name`, `session_id`, `context`）。`context` は「workspace 名（cwd の basename）+ git branch + source」で、プロジェクト名検索を可能にする。索引される `content` は生本文ではなく **表層投影**（`compact::surface`）：散文は全文保持、`tool_use` は名前 + 対象に畳み、成功した `tool_result` 本体は `[result: N lines, M bytes]` スタブに畳み、エラー結果は全文保持する。会話を検索可能に保ちつつ、ツール出力のノイズ（エージェントのバイトの約 97%）を除外する。アップグレード時に再構築し、`meta.fts_recipe` で管理する。
+- `meta` — スキーマ／索引レシピの版マーカー（例：`fts_recipe = surface_v1`。投影を変えると一度きり FTS を再構築する）。
 - `summaries` — セッション要約（consolidate が生成）。`summary_md` 冒頭に `<!-- summarizer: llm|heuristic -->` マーカー。
 - `facts` — 持続的事実。`category`（DECISION / CONSTRAINT / PREFERENCE / ENVIRONMENT）、`superseded_by`（削除せず失効）。`facts_fts` で検索。
 - `sync_state` — 取り込み済みバイトオフセット / 変更検知スタンプ（`<path>` と `<path>#mtime` の 2 キー）。
@@ -118,7 +119,7 @@ MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[t
 
 | ツール | 概要 |
 |---|---|
-| `memory_search` | FTS 検索。scope=self/cross/all（cross/all はユーザー承認ゲート付き） |
+| `memory_search` | 会話の表層に対する FTS 検索。`deep=true` でツール出力本体まで全文部分一致（`LIKE`）フォールバックする。scope=self/cross/all（cross/all はユーザー承認ゲート付き） |
 | `memory_list_sessions` | セッション一覧 + 要約スニペット |
 | `memory_get_session` | セッション履歴（先頭に要約）。`detail` で層を選択: gist（要約のみ）/ min（既定・骨子）/ mid / full。各メッセージに `tokens` メニュー `{min,mid,full}` 付き。type フィルタ既定 user,assistant |
 | `memory_get_entry` | 1 エントリ全文（fulltext 原本、転送キャップあり） |

@@ -26,10 +26,15 @@ pub const RECIPE_VERSION: i64 = 1;
 /// 詳細度。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Level {
-    /// 最大圧縮。会話の骨子だけ (既定)。
+    /// 最大圧縮。会話の骨子だけ (既定)。本文も上限で切り詰める。
     Min,
     /// 中圧縮。流れと意図が追える。
     Mid,
+    /// 検索索引用。**本文(散文)は全保持**し、ツールのペイロードだけ畳む。
+    /// min と違い本文を切り詰めない = 検索語を落とさない。tool_use は名前+対象、
+    /// 成功 tool_result はスタブに畳んでノイズを除き、エラーは検索可能に残す。
+    /// FTS はこのレベルで索引する (会話再構成用の min/mid とは目的が別)。
+    Surface,
 }
 
 // --- 各レベルの畳み込み予算 (文字数) ---
@@ -51,6 +56,12 @@ pub fn compact_pair(entry_type: &str, tool_name: Option<&str>, content: &str) ->
         fold(entry_type, tool_name, content, Level::Min),
         fold(entry_type, tool_name, content, Level::Mid),
     )
+}
+
+/// 検索索引 (FTS) 用の投影。散文は全保持し、ツール出力だけを畳む。
+/// 「表層 (会話) で検索して詳細へ辿る」ための索引本文を作る。
+pub fn surface(entry_type: &str, tool_name: Option<&str>, content: &str) -> String {
+    fold(entry_type, tool_name, content, Level::Surface)
 }
 
 /// 1 エントリの content を指定レベルの投影に畳む。
@@ -107,7 +118,8 @@ fn fold_tool_use_line(rest: &str, level: Level) -> String {
 fn fold_tool_signature(name: &str, input: &Value, level: Level) -> String {
     let target = tool_target(input);
     match level {
-        Level::Min => match target {
+        // Min と Surface は同じ署名 (名前 + 対象)。Surface は本文だけ切り詰めない。
+        Level::Min | Level::Surface => match target {
             Some(t) => format!("[{name} {t}]"),
             None => format!("[{name}]"),
         },
@@ -222,12 +234,15 @@ fn fold_tool_result(item: &Value, level: Level) -> String {
         let cap = match level {
             Level::Min => MIN_ERROR_CAP,
             Level::Mid => MID_ERROR_CAP,
+            // 検索用: エラー文 (探し物になりやすい) は全文を残す。
+            Level::Surface => usize::MAX,
         };
         return format!("[result ERROR: {}]", cap_text(text.trim(), cap));
     }
 
     match level {
-        Level::Min => format!("[result: {lines} lines, {bytes} bytes]"),
+        // 成功したツール出力の本体は索引しない (スタブのみ)。ノイズ源を断つ。
+        Level::Min | Level::Surface => format!("[result: {lines} lines, {bytes} bytes]"),
         Level::Mid => {
             let head = head_of(&text, MID_RESULT_HEAD_LINES, MID_RESULT_HEAD_CHARS);
             if head.trim().is_empty() {
@@ -268,6 +283,8 @@ fn text_cap(level: Level) -> usize {
     match level {
         Level::Min => MIN_TEXT_CAP,
         Level::Mid => MID_TEXT_CAP,
+        // 検索用は散文を切り詰めない (検索語を落とさないため)。
+        Level::Surface => usize::MAX,
     }
 }
 
@@ -388,5 +405,33 @@ mod tests {
     #[test]
     fn recipe_version_is_positive() {
         assert!(RECIPE_VERSION >= 1);
+    }
+
+    // --- Surface (検索索引用) ---
+
+    #[test]
+    fn surface_keeps_full_prose_but_folds_tool_use() {
+        let prose = "決定的なバグの原因はイベントループの競合状態だった。".repeat(40); // 300字超
+        let content = format!("{prose}\n[Tool: Read] {{\"file_path\":\"/x/db.rs\"}}");
+        let s = surface("assistant", Some("Read"), &content);
+        assert!(s.contains(&prose)); // 散文は丸ごと残る
+        assert!(!s.contains("[+")); // 切り詰めマーカーは付かない
+        assert!(s.contains("[Read /x/db.rs]")); // tool_use は署名に畳む
+    }
+
+    #[test]
+    fn surface_drops_successful_tool_result_body() {
+        let content = r#"[{"type":"tool_result","content":"secretword\nline2\nline3"}]"#;
+        let s = surface("user", None, content);
+        assert!(!s.contains("secretword")); // 成功出力の本体は索引しない
+        assert!(s.contains("lines")); // スタブだけ
+    }
+
+    #[test]
+    fn surface_keeps_error_text_searchable() {
+        let content =
+            r#"[{"type":"tool_result","content":"error: cannot find symbol foobar_xyz","is_error":true}]"#;
+        let s = surface("user", None, content);
+        assert!(s.contains("foobar_xyz")); // エラーは検索可能に残す
     }
 }

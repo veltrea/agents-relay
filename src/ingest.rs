@@ -7,8 +7,9 @@ use std::path::Path;
 
 use crate::db;
 
-/// content の最大保存サイズ (bytes)
-const MAX_CONTENT_SIZE: usize = 50_000;
+// content / reasoning の切り詰めポリシーは db::insert_entry_full に集約されている。
+// 上限超の content は先頭だけがメイン DB に inline 保存され、全文は fdb.fulltext に
+// 無損失で退避される（バックアップ・将来の再圧縮のための原本）。
 
 /// JSONL ファイルを差分取り込み
 pub fn ingest_file(conn: &mut Connection, path: &Path) -> Result<u64> {
@@ -59,7 +60,7 @@ pub fn ingest_file(conn: &mut Connection, path: &Path) -> Result<u64> {
         };
 
         if let Some(n) = process_entry(&v, &file_session_id) {
-            db::insert_entry(
+            db::insert_entry_full(
                 &tx,
                 &n.session_id,
                 &n.timestamp,
@@ -71,6 +72,7 @@ pub fn ingest_file(conn: &mut Connection, path: &Path) -> Result<u64> {
                 n.cwd.as_deref(),
                 n.git_branch.as_deref(),
                 "claude",
+                n.reasoning.as_deref(),
             )?;
             count += 1;
 
@@ -132,6 +134,8 @@ struct ParsedEntry {
     content: String,
     cwd: Option<String>,
     git_branch: Option<String>,
+    /// 生 CoT（assistant の thinking ブロック）。content とは別フィールドに退避する。
+    reasoning: Option<String>,
 }
 
 fn process_entry(v: &Value, file_session_id: &str) -> Option<ParsedEntry> {
@@ -168,27 +172,18 @@ fn process_entry(v: &Value, file_session_id: &str) -> Option<ParsedEntry> {
         .and_then(|s| s.as_str())
         .map(String::from);
 
-    let (content, tool_name) = extract_content(v, entry_type);
+    let (content, tool_name, reasoning) = extract_content(v, entry_type);
 
-    // base64 画像データを含むなら除外
-    if content.contains("data:image/") || content.len() > MAX_CONTENT_SIZE {
-        let truncated = if content.len() > MAX_CONTENT_SIZE {
-            let safe_end = truncate_at_char_boundary(&content, 1000);
-            format!("{}... [truncated, {} bytes]", &content[..safe_end], content.len())
-        } else {
-            return None; // 画像データのみなら完全にスキップ
-        };
-        return Some(ParsedEntry {
-            session_id,
-            timestamp,
-            date,
-            time,
-            entry_type: entry_type.to_string(),
-            tool_name,
-            content: truncated,
-            cwd,
-            git_branch,
-        });
+    // reasoning (生 CoT) は無損失で保存する（切り詰めは行わない）
+    let reasoning = reasoning.and_then(|r| {
+        let r = r.trim().to_string();
+        if r.is_empty() { None } else { Some(r) }
+    });
+
+    // 小さな base64 画像のみのエントリはスキップ（テキスト記憶として価値がないため）。
+    // 上限超の content は全文のまま db 層に渡す（inline 頭出し + fdb 全文退避）。
+    if content.contains("data:image/") && content.len() <= db::CONTENT_INLINE_MAX {
+        return None;
     }
 
     Some(ParsedEntry {
@@ -201,10 +196,13 @@ fn process_entry(v: &Value, file_session_id: &str) -> Option<ParsedEntry> {
         content,
         cwd,
         git_branch,
+        reasoning,
     })
 }
 
-fn extract_content(v: &Value, entry_type: &str) -> (String, Option<String>) {
+/// 戻り値: (content=最終応答, tool_name, reasoning=生 CoT)。
+/// CoT は content から分離し、別フィールドへ退避する。
+fn extract_content(v: &Value, entry_type: &str) -> (String, Option<String>, Option<String>) {
     match entry_type {
         "user" => {
             let content = v
@@ -215,7 +213,7 @@ fn extract_content(v: &Value, entry_type: &str) -> (String, Option<String>) {
                     _ => c.to_string(),
                 })
                 .unwrap_or_default();
-            (content, None)
+            (content, None, None)
         }
         "assistant" => {
             let message = v.get("message");
@@ -223,6 +221,7 @@ fn extract_content(v: &Value, entry_type: &str) -> (String, Option<String>) {
                 let content_arr = msg.get("content");
                 if let Some(Value::Array(arr)) = content_arr {
                     let mut texts = Vec::new();
+                    let mut thoughts = Vec::new();
                     let mut tool_name = None;
                     for item in arr {
                         match item.get("type").and_then(|t| t.as_str()) {
@@ -244,19 +243,27 @@ fn extract_content(v: &Value, entry_type: &str) -> (String, Option<String>) {
                                 texts.push(format!("[Tool: {name}] {input}"));
                             }
                             Some("thinking") => {
-                                // thinking は省略（大きすぎる）
+                                // thinking は content には混ぜず reasoning として退避する
+                                if let Some(t) = item.get("thinking").and_then(|t| t.as_str()) {
+                                    thoughts.push(t.to_string());
+                                }
                             }
                             _ => {}
                         }
                     }
-                    return (texts.join("\n"), tool_name);
+                    let reasoning = if thoughts.is_empty() {
+                        None
+                    } else {
+                        Some(thoughts.join("\n"))
+                    };
+                    return (texts.join("\n"), tool_name, reasoning);
                 }
             }
             // slug ベースのエントリ（ストリーミング中間データ）
             if let Some(slug) = v.get("slug").and_then(|s| s.as_str()) {
-                return (format!("[streaming: {slug}]"), None);
+                return (format!("[streaming: {slug}]"), None, None);
             }
-            (String::new(), None)
+            (String::new(), None, None)
         }
         "system" => {
             let content = v
@@ -267,29 +274,17 @@ fn extract_content(v: &Value, entry_type: &str) -> (String, Option<String>) {
                     _ => c.to_string(),
                 })
                 .unwrap_or_else(|| "[system]".to_string());
-            (content, None)
+            (content, None, None)
         }
         "progress" => {
             let content = v.to_string();
-            (content, None)
+            (content, None, None)
         }
         _ => {
             let content = v.to_string();
-            (content, None)
+            (content, None, None)
         }
     }
-}
-
-/// マルチバイト文字の境界を壊さないように切り詰め位置を返す
-fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
-    if max_bytes >= s.len() {
-        return s.len();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
 }
 
 fn parse_datetime(ts: &str) -> (String, String) {
@@ -301,6 +296,167 @@ fn parse_datetime(ts: &str) -> (String, String) {
     } else {
         (ts.to_string(), "00:00:00".to_string())
     }
+}
+
+/// 過去のエントリについて、元 JSONL から失われていたデータを回収する:
+/// - 切り詰め保存された本文の全文 → fdb.fulltext
+/// - 旧バイナリが捨てていた thinking (生 CoT) → rdb.cot
+/// 元ファイルが Claude Code のクリーンアップで消える前に一度実行しておくことで、
+/// 原本を DB 側で自己完結させる。冪等（再実行しても二重登録しない）。
+/// 戻り値: (全文回収件数, 未回収の切り詰めエントリ数, CoT 回収件数)
+pub fn backfill_fulltext(conn: &mut Connection) -> Result<(u64, u64, u64)> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
+    let projects_dir = home.join(".claude").join("projects");
+    let mut filled = 0u64;
+    let mut cot_filled = 0u64;
+
+    if projects_dir.exists() {
+        // .jsonl.bak は Claude Code がセッションを書き直した際の旧版で、
+        // 現行ファイルから消えた内容が残っている場合があるため両方走査する
+        let patterns = [
+            format!("{}/**/*.jsonl", projects_dir.to_string_lossy()),
+            format!("{}/**/*.jsonl.bak", projects_dir.to_string_lossy()),
+        ];
+        for pattern in &patterns {
+        for entry in glob::glob(pattern)? {
+            let path = entry?;
+            let file_session_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .trim_end_matches(".jsonl")
+                .to_string();
+
+            let file = match File::open(&path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            let reader = BufReader::new(file);
+            let tx = conn.transaction()?;
+
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break, // 不正な UTF-8 等はファイルごと打ち切り
+                };
+                let v: Value = match serde_json::from_str(&line) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let parsed = match process_entry(&v, &file_session_id) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                // --- thinking (生 CoT) の回収 ---
+                // 旧バイナリは thinking を捨てて取り込んでいたため、既存行に
+                // CoT が付いていなければ元 JSONL から補完する。誤マッチで別の
+                // エントリに CoT を付けると害が大きいので、こちらは timestamp
+                // まで含めた厳密照合とし、さらに content の先頭も突き合わせる。
+                if let Some(ref reasoning) = parsed.reasoning {
+                    let candidates: Vec<(i64, String)> = {
+                        let mut stmt = tx.prepare(
+                            "SELECT r.id, substr(r.content, 1, 200) FROM raw_entries r
+                             LEFT JOIN rdb.cot c ON c.entry_id = r.id
+                             WHERE r.session_id = ?1 AND r.timestamp = ?2 AND r.type = ?3
+                               AND c.entry_id IS NULL",
+                        )?;
+                        let rows: Vec<(i64, String)> = stmt
+                            .query_map(
+                                rusqlite::params![
+                                    parsed.session_id,
+                                    parsed.timestamp,
+                                    parsed.entry_type
+                                ],
+                                |row| Ok((row.get(0)?, row.get(1)?)),
+                            )?
+                            .collect::<std::result::Result<_, _>>()?;
+                        rows
+                    };
+                    for (id, stored_head) in candidates {
+                        let limit = stored_head.len().min(parsed.content.len()).min(100);
+                        let n = db::truncate_at_char_boundary(&parsed.content, limit);
+                        let matches = n == 0 || stored_head.starts_with(&parsed.content[..n]);
+                        if matches {
+                            tx.execute(
+                                "INSERT OR IGNORE INTO rdb.cot (entry_id, reasoning) VALUES (?1, ?2)",
+                                rusqlite::params![id, reasoning],
+                            )?;
+                            tx.execute(
+                                "UPDATE raw_entries SET reasoning_tokens = ?1
+                                 WHERE id = ?2 AND reasoning_tokens IS NULL",
+                                rusqlite::params![crate::reasoning::estimate_tokens(reasoning), id],
+                            )?;
+                            cot_filled += 1;
+                        }
+                    }
+                }
+
+                // --- 切り詰め本文の全文回収 ---
+                if parsed.content.len() <= db::CONTENT_INLINE_MAX {
+                    continue;
+                }
+
+                // 切り詰めマーカーの末尾 (元のバイト数入り) で対象行を特定する。
+                // Claude Code はセッションファイルを書き直すことがあり (compact 等)、
+                // 過去行のタイムスタンプが現在のファイルとずれている場合があるため、
+                // timestamp は照合キーに使わない。先頭 1000 バイト + 正確なバイト数の
+                // 一致で誤マッチを防ぐ。
+                let suffix = format!("... [truncated, {} bytes]", parsed.content.len());
+                let ids: Vec<i64> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT r.id FROM raw_entries r
+                         LEFT JOIN fdb.fulltext f ON f.entry_id = r.id
+                         WHERE r.session_id = ?1 AND r.type = ?2
+                           AND f.entry_id IS NULL
+                           AND r.content LIKE '%' || ?3",
+                    )?;
+                    let rows: Vec<i64> = stmt
+                        .query_map(
+                            rusqlite::params![
+                                parsed.session_id,
+                                parsed.entry_type,
+                                suffix
+                            ],
+                            |row| row.get(0),
+                        )?
+                        .collect::<std::result::Result<_, _>>()?;
+                    rows
+                };
+
+                // ヘッドも一致する候補すべてに埋める（過去の再取り込みで生じた
+                // 重複行も同じ原本を共有しているため、全行に同じ全文を与える）
+                for id in ids {
+                    let inline: String = tx.query_row(
+                        "SELECT content FROM raw_entries WHERE id = ?1",
+                        rusqlite::params![id],
+                        |row| row.get(0),
+                    )?;
+                    let head = inline.strip_suffix(&suffix).unwrap_or("");
+                    if !head.is_empty() && parsed.content.starts_with(head) {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO fdb.fulltext (entry_id, content) VALUES (?1, ?2)",
+                            rusqlite::params![id, parsed.content],
+                        )?;
+                        filled += 1;
+                    }
+                }
+            }
+            tx.commit()?;
+        }
+        }
+    }
+
+    // 回収できず残った切り詰めエントリ（元ファイルが既に消えている等）
+    let remaining: u64 = conn.query_row(
+        "SELECT COUNT(*) FROM raw_entries r
+         LEFT JOIN fdb.fulltext f ON f.entry_id = r.id
+         WHERE r.content LIKE '%... [truncated, % bytes]' AND f.entry_id IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+
+    Ok((filled, remaining, cot_filled))
 }
 
 /// sync_state の状態表示

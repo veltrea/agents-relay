@@ -248,12 +248,76 @@ fn handle_tool(
                     "time": e.time,
                     "type": e.entry_type,
                     "tool_name": e.tool_name,
-                    "content": e.content,
+                    // 全文原本 (fdb) は数 MB になりうるので、MCP 転送はエージェントの
+                    // コンテキスト保護のため上限で切る。DB 内の原本は無損失のまま。
+                    "content": cap_for_transport(&e.content),
                     "cwd": e.cwd,
                     "git_branch": e.git_branch,
                     "source": e.source,
                 }))?),
                 None => Ok(format!("No entry found with id: {id}")),
+            }
+        }
+
+        // CoT を必要時のみ取得する。mode='summary'(既定)は圧縮版を遅延生成・キャッシュ、
+        // mode='full' は生 CoT を返す。検索/セッション結果は CoT を含まないので、
+        // has_reasoning=true のエントリについてのみ id を渡して呼ぶ。
+        "memory_get_reasoning" => {
+            let id = args.get("id")
+                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+                .unwrap_or(0);
+            let mode = args.get("mode").and_then(|m| m.as_str()).unwrap_or("summary");
+
+            let entry = db::get_entry(conn, id)?;
+            let entry = match entry {
+                Some(e) => e,
+                None => return Ok(format!("No entry found with id: {id}")),
+            };
+            let raw = match entry.reasoning {
+                Some(r) => r,
+                None => return Ok(json!({
+                    "id": id,
+                    "has_reasoning": false,
+                    "message": "No chain-of-thought stored for this entry.",
+                }).to_string()),
+            };
+
+            if mode == "full" {
+                Ok(json!({
+                    "id": id,
+                    "mode": "full",
+                    "reasoning": cap_for_transport(&raw),
+                    "reasoning_tokens": entry.reasoning_tokens,
+                }).to_string())
+            } else {
+                // summary: キャッシュがあれば使い、なければ生成して保存
+                let (summary, summarizer) = match entry.reasoning_summary {
+                    Some(s) => (s, "cached"),
+                    None => {
+                        let cfg = Config::load().unwrap_or_default();
+                        let llm = crate::reasoning::LlmConfig {
+                            enabled: cfg.reasoning_llm_enabled,
+                            base_url: cfg.reasoning_llm_base_url,
+                            model: cfg.reasoning_llm_model,
+                            timeout_secs: cfg.reasoning_llm_timeout_secs,
+                        };
+                        let result = crate::reasoning::summarize_best(&raw, Some(&llm));
+                        if let Err(e) = db::set_reasoning_summary(conn, id, &result.text) {
+                            eprintln!("agents-relay server: failed to cache reasoning summary: {e}");
+                        }
+                        let kind = if result.used_llm { "llm" } else { "heuristic" };
+                        (result.text, kind)
+                    }
+                };
+                Ok(json!({
+                    "id": id,
+                    "mode": "summary",
+                    "summarizer": summarizer,
+                    "reasoning_summary": summary,
+                    "summary_tokens": crate::reasoning::estimate_tokens(&summary),
+                    "full_tokens": entry.reasoning_tokens,
+                    "hint": "Call again with mode='full' for the complete chain-of-thought.",
+                }).to_string())
             }
         }
 
@@ -266,13 +330,21 @@ fn handle_tool(
             let sessions = db::list_sessions(conn, date, limit, workspace)?;
             let result: Vec<Value> = sessions
                 .iter()
-                .map(|(sid, first, last, d, count)| json!({
-                    "session_id": sid,
-                    "first_timestamp": first,
-                    "last_timestamp": last,
-                    "date": d,
-                    "entry_count": count,
-                }))
+                .map(|(sid, first, last, d, count)| {
+                    let mut obj = json!({
+                        "session_id": sid,
+                        "first_timestamp": first,
+                        "last_timestamp": last,
+                        "date": d,
+                        "entry_count": count,
+                    });
+                    // consolidate 済みならセッション要約の先頭を添える
+                    if let Ok(Some(summary)) = db::get_summary(conn, sid) {
+                        let text = strip_summarizer_marker(&summary);
+                        obj["summary"] = json!(truncate_chars_srv(text, 300));
+                    }
+                    obj
+                })
                 .collect();
             Ok(serde_json::to_string_pretty(&result)?)
         }
@@ -297,17 +369,54 @@ fn handle_tool(
                 anyhow::bail!("Provide session_id or date/date_from/date_to");
             };
 
-            let result: Vec<Value> = entries
+            let mut result: Vec<Value> = entries
                 .iter()
-                .map(|e| json!({
-                    "id": e.id,
-                    "session_id": e.session_id,
-                    "timestamp": e.timestamp,
-                    "time": e.time,
-                    "type": e.entry_type,
-                    "tool_name": e.tool_name,
-                    "content": e.content,
-                    "source": e.source,
+                .map(|e| {
+                    let mut obj = json!({
+                        "id": e.id,
+                        "session_id": e.session_id,
+                        "timestamp": e.timestamp,
+                        "time": e.time,
+                        "type": e.entry_type,
+                        "tool_name": e.tool_name,
+                        "content": e.content,
+                        "source": e.source,
+                    });
+                    add_reasoning_pointer(&mut obj, e.reasoning_tokens);
+                    obj
+                })
+                .collect();
+            // セッション指定なら、consolidate 済み要約を先頭に付ける
+            if let Some(sid) = session_id {
+                if let Ok(Some(summary)) = db::get_summary(conn, sid) {
+                    result.insert(0, json!({
+                        "type": "session_summary",
+                        "session_id": sid,
+                        "content": strip_summarizer_marker(&summary),
+                    }));
+                }
+            }
+            Ok(serde_json::to_string_pretty(&result)?)
+        }
+
+        // consolidate が蓄積した持続的事実 (決定・制約・好み・環境) を検索する
+        "memory_facts" => {
+            let query = args.get("query").and_then(|q| q.as_str()).unwrap_or("");
+            let ws_filter = args.get("workspace").and_then(|w| w.as_str()).or(workspace);
+            let limit = args.get("limit")
+                .and_then(|l| l.as_i64().or_else(|| l.as_f64().map(|f| f as i64)))
+                .unwrap_or(20);
+
+            let facts = db::search_facts(conn, query, ws_filter, limit)?;
+            let result: Vec<Value> = facts
+                .iter()
+                .map(|(id, category, fact, ws, sid, created)| json!({
+                    "id": id,
+                    "category": category,
+                    "fact": fact,
+                    "workspace": ws,
+                    "session_id": sid,
+                    "created_at": created,
                 }))
                 .collect();
             Ok(serde_json::to_string_pretty(&result)?)
@@ -418,18 +527,73 @@ fn handle_tool(
 fn format_entries(entries: &[db::RawEntry]) -> Vec<Value> {
     entries
         .iter()
-        .map(|e| json!({
-            "id": e.id,
-            "session_id": e.session_id,
-            "timestamp": e.timestamp,
-            "date": e.date,
-            "time": e.time,
-            "type": e.entry_type,
-            "tool_name": e.tool_name,
-            "content": e.content,
-            "cwd": e.cwd,
-            "git_branch": e.git_branch,
-            "source": e.source,
-        }))
+        .map(|e| {
+            let mut obj = json!({
+                "id": e.id,
+                "session_id": e.session_id,
+                "timestamp": e.timestamp,
+                "date": e.date,
+                "time": e.time,
+                "type": e.entry_type,
+                "tool_name": e.tool_name,
+                "content": e.content,
+                "cwd": e.cwd,
+                "git_branch": e.git_branch,
+                "source": e.source,
+            });
+            // CoT 本文は返さず、存在を示すポインタだけ付ける（必要時 memory_get_reasoning で取得）
+            add_reasoning_pointer(&mut obj, e.reasoning_tokens);
+            obj
+        })
         .collect()
+}
+
+/// 検索/セッション結果に CoT ポインタを付与する。
+/// 本文は含めず、has_reasoning と概算トークン数のみ。これでデフォルトのトークン消費を抑える。
+/// summaries の summary_md 先頭にある `<!-- summarizer: ... -->` マーカーを剥がす
+fn strip_summarizer_marker(summary: &str) -> &str {
+    if let Some(rest) = summary.strip_prefix("<!--") {
+        if let Some(end) = rest.find("-->") {
+            return rest[end + 3..].trim_start();
+        }
+    }
+    summary
+}
+
+/// マルチバイト境界を壊さずに文字数で切り詰める (表示用)
+fn truncate_chars_srv(s: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i >= max_chars {
+            out.push('…');
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// MCP レスポンスに載せる content の上限 (bytes)。fdb の全文原本は数 MB に
+/// なりうるため、呼び出し側エージェントのコンテキストを守る目的で転送だけ切る。
+const TRANSPORT_CONTENT_MAX: usize = 200_000;
+
+fn cap_for_transport(content: &str) -> String {
+    if content.len() <= TRANSPORT_CONTENT_MAX {
+        return content.to_string();
+    }
+    let end = db::truncate_at_char_boundary(content, TRANSPORT_CONTENT_MAX);
+    format!(
+        "{}... [transport limit: full {} bytes stored losslessly in DB]",
+        &content[..end],
+        content.len()
+    )
+}
+
+fn add_reasoning_pointer(obj: &mut Value, reasoning_tokens: Option<i64>) {
+    if let Some(tokens) = reasoning_tokens {
+        if tokens > 0 {
+            obj["has_reasoning"] = json!(true);
+            obj["reasoning_tokens"] = json!(tokens);
+        }
+    }
 }

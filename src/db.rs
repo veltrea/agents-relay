@@ -7,7 +7,66 @@ pub fn open(path: &Path) -> Result<Connection> {
     // 複数プロセスが同時起動した場合の BUSY 対策: 最大 5 秒待ってリトライ
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+    attach_side_dbs(&conn, path)?;
     Ok(conn)
+}
+
+/// メイン DB (memory.db) を恒久的に低容量に保つため、大きなデータは
+/// 同じディレクトリの分離 DB に退避する:
+/// - reasoning.db (rdb.cot):      生 CoT と要約。削除しても検索は壊れない
+///   （memory_get_reasoning が has_reasoning=false を返すだけ）。
+/// - fulltext.db (fdb.fulltext):  CONTENT_INLINE_MAX 超の content 全文。
+///   将来の再圧縮・再処理のための無損失原本。メイン DB 側には先頭だけを
+///   inline 保存し FTS 索引もそちらで張る。
+fn attach_side_dbs(conn: &Connection, db_path: &Path) -> Result<()> {
+    let rpath = db_path.with_file_name("reasoning.db");
+    conn.execute(
+        "ATTACH DATABASE ?1 AS rdb",
+        params![rpath.to_string_lossy()],
+    )?;
+    let fpath = db_path.with_file_name("fulltext.db");
+    conn.execute(
+        "ATTACH DATABASE ?1 AS fdb",
+        params![fpath.to_string_lossy()],
+    )?;
+    conn.execute_batch(
+        "PRAGMA rdb.journal_mode=WAL;
+         PRAGMA fdb.journal_mode=WAL;
+         CREATE TABLE IF NOT EXISTS rdb.cot (
+             entry_id INTEGER PRIMARY KEY,
+             reasoning TEXT,
+             reasoning_summary TEXT
+         );
+         CREATE TABLE IF NOT EXISTS fdb.fulltext (
+             entry_id INTEGER PRIMARY KEY,
+             content TEXT NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+/// content をメイン DB に inline 保存する上限 (bytes)。
+/// これを超える本文は先頭 CONTENT_HEAD_BYTES + マーカーだけを inline 保存し、
+/// 全文を fdb.fulltext に無損失で退避する。
+pub const CONTENT_INLINE_MAX: usize = 50_000;
+const CONTENT_HEAD_BYTES: usize = 1_000;
+
+/// 切り詰めマーカー付きの inline 表現を作る（旧 ingest の形式と互換）
+fn inline_head(content: &str) -> String {
+    let end = truncate_at_char_boundary(content, CONTENT_HEAD_BYTES);
+    format!("{}... [truncated, {} bytes]", &content[..end], content.len())
+}
+
+/// マルチバイト文字の境界を壊さないように切り詰め位置を返す
+pub fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> usize {
+    if max_bytes >= s.len() {
+        return s.len();
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 pub fn init(conn: &Connection) -> Result<()> {
@@ -25,6 +84,7 @@ pub fn init(conn: &Connection) -> Result<()> {
             cwd TEXT,
             git_branch TEXT,
             source TEXT NOT NULL DEFAULT 'claude',
+            reasoning_tokens INTEGER,
             created_at TEXT DEFAULT (datetime('now'))
         );
 
@@ -33,7 +93,7 @@ pub fn init(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_raw_date ON raw_entries(date);
         CREATE INDEX IF NOT EXISTS idx_raw_type ON raw_entries(type);
         CREATE VIRTUAL TABLE IF NOT EXISTS raw_entries_fts USING fts5(
-            content, tool_name, session_id
+            content, tool_name, session_id, context
         );
 
         CREATE TABLE IF NOT EXISTS sync_state (
@@ -51,6 +111,21 @@ pub fn init(conn: &Connection) -> Result<()> {
             summary_md TEXT NOT NULL,
             created_at TEXT DEFAULT (datetime('now'))
         );
+
+        -- 持続的な事実 (決定・制約・好み・環境)。consolidate が抽出して蓄積する。
+        -- 削除はせず superseded_by で失効させる (bi-temporal の軽量版)。
+        CREATE TABLE IF NOT EXISTS facts (
+            id INTEGER PRIMARY KEY,
+            category TEXT NOT NULL,
+            fact TEXT NOT NULL,
+            workspace TEXT,
+            session_id TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            superseded_by INTEGER
+        );
+        CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+            fact, category, workspace
+        );
         ",
     )?;
 
@@ -60,19 +135,49 @@ pub fn init(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn migrate(conn: &Connection) -> Result<()> {
-    // source カラムの存在チェック
-    let has_source: bool = conn
-        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='raw_entries'")?
-        .query_row([], |row| row.get::<_, String>(0))
-        .map(|sql| sql.contains("source"))
-        .unwrap_or(false);
+/// raw_entries の実カラム名一覧 (PRAGMA table_info)
+fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let cols = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(cols)
+}
 
-    if !has_source {
+fn migrate(conn: &Connection) -> Result<()> {
+    let cols = table_columns(conn, "raw_entries")?;
+    let has = |name: &str| cols.iter().any(|c| c == name);
+
+    if !has("source") {
         conn.execute_batch(
             "ALTER TABLE raw_entries ADD COLUMN source TEXT NOT NULL DEFAULT 'claude';"
         )?;
         eprintln!("Migration: added 'source' column to raw_entries");
+    }
+
+    // CoT ポインタ (概算トークン数) はメイン DB に持つ。実体は rdb.cot に分離。
+    if !has("reasoning_tokens") {
+        conn.execute_batch("ALTER TABLE raw_entries ADD COLUMN reasoning_tokens INTEGER;")?;
+        eprintln!("Migration: added 'reasoning_tokens' column to raw_entries");
+    }
+
+    // 旧レイアウト (raw_entries に reasoning / reasoning_summary が同居) からの移行:
+    // データを rdb.cot に移してからカラムを落とす
+    if has("reasoning") || has("reasoning_summary") {
+        if has("reasoning") && has("reasoning_summary") {
+            conn.execute_batch(
+                "INSERT OR REPLACE INTO rdb.cot (entry_id, reasoning, reasoning_summary)
+                     SELECT id, reasoning, reasoning_summary FROM raw_entries
+                     WHERE reasoning IS NOT NULL OR reasoning_summary IS NOT NULL;",
+            )?;
+        }
+        if has("reasoning") {
+            conn.execute_batch("ALTER TABLE raw_entries DROP COLUMN reasoning;")?;
+        }
+        if has("reasoning_summary") {
+            conn.execute_batch("ALTER TABLE raw_entries DROP COLUMN reasoning_summary;")?;
+        }
+        eprintln!("Migration: moved chain-of-thought to reasoning.db (rdb.cot)");
     }
 
     // インデックスは常に確保（IF NOT EXISTS なので安全）
@@ -81,18 +186,52 @@ fn migrate(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_raw_cwd ON raw_entries(cwd);"
     )?;
 
+    // FTS に context 列 (workspace 名 + branch + source) がなければ再構築。
+    // プロジェクト名やブランチ名でも過去の記憶を検索できるようにするため
+    // (contextual retrieval の軽量版)。53万行で 20 秒程度の一回きりの処理。
+    let fts_has_context: bool = conn
+        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='raw_entries_fts'")?
+        .query_row([], |row| row.get::<_, String>(0))
+        .map(|sql| sql.contains("context"))
+        .unwrap_or(true);
+    if !fts_has_context {
+        eprintln!("Migration: rebuilding FTS index with context column (one-time, ~20s)...");
+        rebuild_fts(conn)?;
+        eprintln!("Migration: FTS context rebuild done");
+    }
+
     Ok(())
 }
 
+/// FTS の context 列: workspace 名 (cwd の basename)・branch・source を検索語彙に載せる。
+/// 本文には混ぜない (snippet や get_entry の内容を汚さないため)。
+fn fts_context(cwd: Option<&str>, git_branch: Option<&str>, source: &str) -> String {
+    let ws = cwd
+        .map(|c| c.trim_end_matches('/'))
+        .and_then(|c| c.rsplit('/').next())
+        .unwrap_or("");
+    format!("{} {} {}", ws, git_branch.unwrap_or(""), source)
+        .trim()
+        .to_string()
+}
+
+/// rebuild_fts 内で context を SQL 側で計算する式 (fts_context と同じ内容)
+const FTS_CONTEXT_SQL: &str = "trim(COALESCE(substr(rtrim(cwd, '/'), length(rtrim(rtrim(cwd, '/'), replace(rtrim(cwd, '/'), '/', ''))) + 1), '') || ' ' || COALESCE(git_branch, '') || ' ' || source)";
+
 /// FTS インデックスを安全に再構築する（delete-all + rebuild）
 pub fn rebuild_fts(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+    // 'delete-all' は contentless/external-content FTS5 専用のため、
+    // 通常の FTS5 テーブルでは DROP → 再作成で全再構築する
+    conn.execute_batch(&format!(
         "
-        INSERT INTO raw_entries_fts(raw_entries_fts) VALUES('delete-all');
-        INSERT INTO raw_entries_fts(rowid, content, tool_name, session_id)
-            SELECT id, content, tool_name, session_id FROM raw_entries;
+        DROP TABLE IF EXISTS raw_entries_fts;
+        CREATE VIRTUAL TABLE raw_entries_fts USING fts5(
+            content, tool_name, session_id, context
+        );
+        INSERT INTO raw_entries_fts(rowid, content, tool_name, session_id, context)
+            SELECT id, content, tool_name, session_id, {FTS_CONTEXT_SQL} FROM raw_entries;
         ",
-    )?;
+    ))?;
     Ok(())
 }
 
@@ -103,6 +242,8 @@ pub fn reset(conn: &Connection) -> Result<()> {
         DROP TABLE IF EXISTS raw_entries;
         DROP TABLE IF EXISTS sync_state;
         DROP TABLE IF EXISTS summaries;
+        DELETE FROM rdb.cot;
+        DELETE FROM fdb.fulltext;
         ",
     )?;
     init(conn)?;
@@ -122,8 +263,15 @@ pub struct RawEntry {
     pub cwd: Option<String>,
     pub git_branch: Option<String>,
     pub source: String,
+    /// 生 CoT。get_entry でのみ全文を取得する。検索/セッション結果では常に None。
+    pub reasoning: Option<String>,
+    /// 圧縮済み CoT。memory_get_reasoning(mode=summary) 初回呼び出し時に遅延生成・キャッシュ。
+    pub reasoning_summary: Option<String>,
+    /// 生 CoT の概算トークン数。ポインタ (has_reasoning) と予算判断に使う。
+    pub reasoning_tokens: Option<i64>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn insert_entry(
     conn: &Connection,
     session_id: &str,
@@ -137,21 +285,81 @@ pub fn insert_entry(
     git_branch: Option<&str>,
     source: &str,
 ) -> Result<i64> {
+    insert_entry_full(
+        conn, session_id, timestamp, date, time, entry_type,
+        tool_name, content, cwd, git_branch, source, None,
+    )
+}
+
+/// CoT (reasoning) を別フィールドに分離して保存する版。
+/// reasoning は FTS インデックスには載せない（検索ノイズと肥大を避けるため）。
+#[allow(clippy::too_many_arguments)]
+pub fn insert_entry_full(
+    conn: &Connection,
+    session_id: &str,
+    timestamp: &str,
+    date: &str,
+    time: &str,
+    entry_type: &str,
+    tool_name: Option<&str>,
+    content: &str,
+    cwd: Option<&str>,
+    git_branch: Option<&str>,
+    source: &str,
+    reasoning: Option<&str>,
+) -> Result<i64> {
+    let reasoning_tokens = reasoning.map(crate::reasoning::estimate_tokens);
+
+    // 切り詰めポリシーはここに集約する。呼び出し側は常に全文を渡してよい。
+    // 上限超過分は inline に頭だけ残し、全文を fdb に無損失退避する。
+    let (inline, overflow): (std::borrow::Cow<str>, Option<&str>) =
+        if content.len() > CONTENT_INLINE_MAX {
+            (std::borrow::Cow::Owned(inline_head(content)), Some(content))
+        } else {
+            (std::borrow::Cow::Borrowed(content), None)
+        };
+
     conn.execute(
-        "INSERT INTO raw_entries (session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch, source)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![session_id, timestamp, date, time, entry_type, tool_name, content, cwd, git_branch, source],
+        "INSERT INTO raw_entries (session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch, source, reasoning_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![session_id, timestamp, date, time, entry_type, tool_name, inline, cwd, git_branch, source, reasoning_tokens],
     )?;
     let id = conn.last_insert_rowid();
 
-    // FTS に同期
+    // 全文原本は分離 DB (fdb.fulltext) へ
+    if let Some(full) = overflow {
+        conn.execute(
+            "INSERT OR REPLACE INTO fdb.fulltext (entry_id, content) VALUES (?1, ?2)",
+            params![id, full],
+        )?;
+    }
+
+    // 生 CoT は分離 DB (rdb.cot) へ（無損失・切り詰めなし）
+    if let Some(r) = reasoning {
+        conn.execute(
+            "INSERT OR REPLACE INTO rdb.cot (entry_id, reasoning) VALUES (?1, ?2)",
+            params![id, r],
+        )?;
+    }
+
+    // FTS に同期（inline content のみ。reasoning / 全文原本は意図的にインデックスしない）
     conn.execute(
-        "INSERT INTO raw_entries_fts (rowid, content, tool_name, session_id)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![id, content, tool_name, session_id],
+        "INSERT INTO raw_entries_fts (rowid, content, tool_name, session_id, context)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![id, inline, tool_name, session_id, fts_context(cwd, git_branch, source)],
     )?;
 
     Ok(id)
+}
+
+/// 圧縮済み CoT をキャッシュする（memory_get_reasoning の遅延生成時に呼ぶ）。
+pub fn set_reasoning_summary(conn: &Connection, id: i64, summary: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO rdb.cot (entry_id, reasoning_summary) VALUES (?1, ?2)
+         ON CONFLICT(entry_id) DO UPDATE SET reasoning_summary = ?2",
+        params![id, summary],
+    )?;
+    Ok(())
 }
 
 pub fn get_sync_offset(conn: &Connection, file_path: &str) -> Result<i64> {
@@ -172,6 +380,268 @@ pub fn set_sync_offset(conn: &Connection, file_path: &str, offset: i64) -> Resul
         params![file_path, offset],
     )?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// summaries / facts (睡眠時整理 consolidate 用)
+// ---------------------------------------------------------------------------
+
+/// セッション要約を UPSERT する
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_summary(
+    conn: &Connection,
+    session_id: &str,
+    project_path: Option<&str>,
+    git_branch: Option<&str>,
+    started_at: &str,
+    ended_at: &str,
+    summary_md: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO summaries (session_id, project_path, git_branch, started_at, ended_at, summary_md)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id) DO UPDATE SET
+             project_path = ?2, git_branch = ?3, started_at = ?4, ended_at = ?5, summary_md = ?6",
+        params![session_id, project_path, git_branch, started_at, ended_at, summary_md],
+    )?;
+    Ok(())
+}
+
+pub fn get_summary(conn: &Connection, session_id: &str) -> Result<Option<String>> {
+    let s = conn
+        .query_row(
+            "SELECT summary_md FROM summaries WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )
+        .ok();
+    Ok(s)
+}
+
+/// 要約が必要なセッション (未要約、または要約後に新しいエントリが増えたもの) を返す。
+/// upgrade_heuristic=true なら、ヒューリスティック要約のままのセッションも
+/// 再処理対象に含める (LLM が使えるようになった後の格上げ用)。
+/// 戻り値: (session_id, started, ended, entry_count)
+pub fn sessions_needing_summary(
+    conn: &Connection,
+    min_entries: i64,
+    idle_cutoff: &str,
+    limit: i64,
+    upgrade_heuristic: bool,
+) -> Result<Vec<(String, String, String, i64)>> {
+    let upgrade_clause = if upgrade_heuristic {
+        "OR EXISTS (SELECT 1 FROM summaries s2 WHERE s2.session_id = r.session_id
+                    AND s2.summary_md LIKE '<!-- summarizer: heuristic -->%')"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT r.session_id, MIN(r.timestamp), MAX(r.timestamp), COUNT(*)
+         FROM raw_entries r
+         WHERE r.type IN ('user', 'assistant')
+         GROUP BY r.session_id
+         HAVING COUNT(*) >= ?1
+            AND MAX(r.timestamp) <= ?2
+            AND (MAX(r.timestamp) > COALESCE(
+                (SELECT s.ended_at FROM summaries s WHERE s.session_id = r.session_id), '')
+                {upgrade_clause})
+         ORDER BY MAX(r.timestamp) DESC
+         LIMIT ?3"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params![min_entries, idle_cutoff, limit], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// 文字バイグラム Jaccard 類似度 (0.0-1.0)。日本語にも頑健な軽量類似判定。
+pub fn bigram_similarity(a: &str, b: &str) -> f64 {
+    fn bigrams(s: &str) -> std::collections::HashSet<(char, char)> {
+        let chars: Vec<char> = s.chars().filter(|c| !c.is_whitespace()).collect();
+        chars.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+    let (sa, sb) = (bigrams(a), bigrams(b));
+    if sa.is_empty() || sb.is_empty() {
+        return if a.trim() == b.trim() { 1.0 } else { 0.0 };
+    }
+    let inter = sa.intersection(&sb).count() as f64;
+    let union = sa.union(&sb).count() as f64;
+    inter / union
+}
+
+/// 新規性ゲート: 既存の有効な事実に類似するものがあればその id を返す。
+/// 類似度は文字バイグラム Jaccard >= 0.6 で「既知」とみなす。
+pub fn find_duplicate_fact(conn: &Connection, fact: &str) -> Result<Option<i64>> {
+    let mut stmt =
+        conn.prepare("SELECT id, fact FROM facts WHERE superseded_by IS NULL")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, existing) = row?;
+        if bigram_similarity(fact, &existing) >= 0.6 {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
+pub fn insert_fact(
+    conn: &Connection,
+    category: &str,
+    fact: &str,
+    workspace: Option<&str>,
+    session_id: &str,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO facts (category, fact, workspace, session_id) VALUES (?1, ?2, ?3, ?4)",
+        params![category, fact, workspace, session_id],
+    )?;
+    let id = conn.last_insert_rowid();
+    conn.execute(
+        "INSERT INTO facts_fts (rowid, fact, category, workspace) VALUES (?1, ?2, ?3, ?4)",
+        params![id, fact, category, workspace],
+    )?;
+    Ok(id)
+}
+
+/// 事実の検索。query が空なら新しい順に一覧。
+/// 戻り値: (id, category, fact, workspace, session_id, created_at)
+pub fn search_facts(
+    conn: &Connection,
+    query: &str,
+    workspace: Option<&str>,
+    limit: i64,
+) -> Result<Vec<(i64, String, String, Option<String>, Option<String>, String)>> {
+    let trimmed = query.trim();
+    let mut out = Vec::new();
+
+    let (sql, use_query) = if trimmed.is_empty() || trimmed == "*" {
+        (
+            "SELECT f.id, f.category, f.fact, f.workspace, f.session_id, f.created_at
+             FROM facts f
+             WHERE f.superseded_by IS NULL
+               AND (?1 IS NULL OR f.workspace = ?1 OR f.workspace IS NULL)
+             ORDER BY f.id DESC LIMIT ?2"
+                .to_string(),
+            false,
+        )
+    } else {
+        (
+            "SELECT f.id, f.category, f.fact, f.workspace, f.session_id, f.created_at
+             FROM facts_fts t
+             JOIN facts f ON f.id = t.rowid
+             WHERE facts_fts MATCH ?3 AND f.superseded_by IS NULL
+               AND (?1 IS NULL OR f.workspace = ?1 OR f.workspace IS NULL)
+             ORDER BY rank LIMIT ?2"
+                .to_string(),
+            true,
+        )
+    };
+
+    let mut stmt = conn.prepare(&sql)?;
+    let map = |row: &rusqlite::Row| -> rusqlite::Result<_> {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    };
+    if use_query {
+        let fts_query = normalize_fts_query(trimmed);
+        let rows = stmt.query_map(params![workspace, limit, fts_query], map)?;
+        for r in rows {
+            out.push(r?);
+        }
+    } else {
+        let rows = stmt.query_map(params![workspace, limit], map)?;
+        for r in rows {
+            out.push(r?);
+        }
+    }
+    Ok(out)
+}
+
+/// 持ち出し・バックアップ用の軽量コピーを一方向生成する。
+/// 含む: raw_entries (CoT ポインタは NULL 化)・summaries・sync_state・空の FTS テーブル。
+/// 含まない: 生 CoT (reasoning.db)・FTS 索引の実体 (復元先で `db rebuild-fts` すれば戻る)。
+pub fn export_light(conn: &Connection, out: &Path) -> Result<i64> {
+    if out.exists() {
+        anyhow::bail!("Output file already exists: {}", out.display());
+    }
+    conn.execute(
+        "ATTACH DATABASE ?1 AS light",
+        params![out.to_string_lossy()],
+    )?;
+
+    let result = (|| -> Result<i64> {
+        conn.execute_batch(
+            "
+            CREATE TABLE light.raw_entries (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                timestamp TEXT NOT NULL,
+                date TEXT NOT NULL,
+                time TEXT NOT NULL,
+                type TEXT NOT NULL,
+                tool_name TEXT,
+                content TEXT NOT NULL,
+                cwd TEXT,
+                git_branch TEXT,
+                source TEXT NOT NULL DEFAULT 'claude',
+                reasoning_tokens INTEGER,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            INSERT INTO light.raw_entries
+                (id, session_id, timestamp, date, time, type, tool_name, content,
+                 cwd, git_branch, source, reasoning_tokens, created_at)
+                SELECT id, session_id, timestamp, date, time, type, tool_name, content,
+                       cwd, git_branch, source, NULL, created_at
+                FROM raw_entries;
+
+            CREATE INDEX light.idx_raw_session ON raw_entries(session_id);
+            CREATE INDEX light.idx_raw_timestamp ON raw_entries(timestamp);
+            CREATE INDEX light.idx_raw_date ON raw_entries(date);
+            CREATE INDEX light.idx_raw_type ON raw_entries(type);
+            CREATE INDEX light.idx_raw_source ON raw_entries(source);
+            CREATE INDEX light.idx_raw_cwd ON raw_entries(cwd);
+
+            CREATE TABLE light.sync_state (
+                file_path TEXT PRIMARY KEY,
+                last_offset INTEGER DEFAULT 0
+            );
+            INSERT INTO light.sync_state SELECT * FROM sync_state;
+
+            CREATE TABLE light.summaries (
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL UNIQUE,
+                project_path TEXT,
+                git_branch TEXT,
+                started_at TEXT,
+                ended_at TEXT,
+                summary_md TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now'))
+            );
+            INSERT INTO light.summaries SELECT * FROM summaries;
+
+            CREATE VIRTUAL TABLE light.raw_entries_fts USING fts5(
+                content, tool_name, session_id, context
+            );
+            ",
+        )?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM light.raw_entries", [], |row| row.get(0))?;
+        Ok(count)
+    })();
+
+    conn.execute_batch("DETACH DATABASE light")?;
+    result
 }
 
 pub fn stats(conn: &Connection) -> Result<String> {
@@ -195,12 +665,35 @@ pub fn stats(conn: &Connection) -> Result<String> {
     let min_date = date_range.0.unwrap_or_else(|| "(none)".to_string());
     let max_date = date_range.1.unwrap_or_else(|| "(none)".to_string());
 
+    let cot_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM rdb.cot", [], |row| row.get(0))?;
+    let fulltext_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM fdb.fulltext", [], |row| row.get(0))?;
+
+    // main / rdb それぞれのファイルサイズ
+    let mut sizes = String::new();
+    let mut stmt = conn.prepare("SELECT name, file FROM pragma_database_list")?;
+    let files = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for f in files.flatten() {
+        let (name, file) = f;
+        if file.is_empty() {
+            continue;
+        }
+        let mb = std::fs::metadata(&file).map(|m| m.len() / 1_048_576).unwrap_or(0);
+        sizes.push_str(&format!("\n  {name}: {mb} MB ({file})"));
+    }
+
     Ok(format!(
         "Entries:    {entry_count}\n\
          Sessions:   {session_count}\n\
          Date range: {min_date} .. {max_date}\n\
          Summaries:  {summary_count}\n\
-         Tracked files: {sync_count}"
+         CoT stored: {cot_count}\n\
+         Fulltext overflow: {fulltext_count}\n\
+         Tracked files: {sync_count}\n\
+         Databases:{sizes}"
     ))
 }
 
@@ -258,7 +751,7 @@ pub fn search(
         sql = String::from(
             "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type,
                     r.tool_name, snippet(raw_entries_fts, 0, '>>','<<', '...', 40) as content,
-                    r.cwd, r.git_branch, r.source
+                    r.cwd, r.git_branch, r.source, r.reasoning_tokens
              FROM raw_entries_fts f
              JOIN raw_entries r ON r.id = f.rowid
              WHERE raw_entries_fts MATCH ?1",
@@ -271,7 +764,7 @@ pub fn search(
         sql = String::from(
             "SELECT id, session_id, timestamp, date, time, type,
                     tool_name, substr(content, 1, 200) as content,
-                    cwd, git_branch, source
+                    cwd, git_branch, source, reasoning_tokens
              FROM raw_entries
              WHERE 1=1",
         );
@@ -349,6 +842,9 @@ pub fn search(
             cwd: row.get(8)?,
             git_branch: row.get(9)?,
             source: row.get(10)?,
+            reasoning: None,
+            reasoning_summary: None,
+            reasoning_tokens: row.get(11)?,
         })
     })?;
 
@@ -362,8 +858,14 @@ pub fn search(
 /// エントリ全文取得
 pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
     let mut stmt = conn.prepare(
-        "SELECT id, session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch, source
-         FROM raw_entries WHERE id = ?1",
+        "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type, r.tool_name,
+                COALESCE(f.content, r.content) AS content,
+                r.cwd, r.git_branch, r.source,
+                c.reasoning, c.reasoning_summary, r.reasoning_tokens
+         FROM raw_entries r
+         LEFT JOIN rdb.cot c ON c.entry_id = r.id
+         LEFT JOIN fdb.fulltext f ON f.entry_id = r.id
+         WHERE r.id = ?1",
     )?;
     let entry = stmt
         .query_row(params![id], |row| {
@@ -379,6 +881,9 @@ pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
                 cwd: row.get(8)?,
                 git_branch: row.get(9)?,
                 source: row.get(10)?,
+                reasoning: row.get(11)?,
+                reasoning_summary: row.get(12)?,
+                reasoning_tokens: row.get(13)?,
             })
         })
         .ok();
@@ -460,7 +965,7 @@ pub fn get_session_entries(
         (
             format!(
                 "SELECT id, session_id, timestamp, date, time, type, tool_name,
-                        substr(content, 1, 200) as content, cwd, git_branch, source
+                        substr(content, 1, 200) as content, cwd, git_branch, source, reasoning_tokens
                  FROM raw_entries WHERE session_id = ?1 AND type IN ({})
                  ORDER BY timestamp ASC LIMIT ?{limit_idx}",
                 placeholders.join(", ")
@@ -470,7 +975,7 @@ pub fn get_session_entries(
     } else {
         (
             "SELECT id, session_id, timestamp, date, time, type, tool_name,
-                    substr(content, 1, 200) as content, cwd, git_branch, source
+                    substr(content, 1, 200) as content, cwd, git_branch, source, reasoning_tokens
              FROM raw_entries WHERE session_id = ?1 AND type IN ('user', 'assistant')
              ORDER BY timestamp ASC LIMIT ?2"
                 .to_string(),
@@ -493,6 +998,9 @@ pub fn get_session_entries(
             cwd: row.get(8)?,
             git_branch: row.get(9)?,
             source: row.get(10)?,
+            reasoning: None,
+            reasoning_summary: None,
+            reasoning_tokens: row.get(11)?,
         })
     })?;
 
@@ -526,7 +1034,7 @@ pub fn get_entries_by_date_range(
 
     let sql = format!(
         "SELECT id, session_id, timestamp, date, time, type, tool_name,
-                substr(content, 1, 200) as content, cwd, git_branch, source
+                substr(content, 1, 200) as content, cwd, git_branch, source, reasoning_tokens
          FROM raw_entries WHERE date >= ?1 AND date <= ?2 AND type IN ({})
          ORDER BY timestamp ASC LIMIT ?{limit_idx}",
         placeholders.join(", ")
@@ -547,6 +1055,9 @@ pub fn get_entries_by_date_range(
             cwd: row.get(8)?,
             git_branch: row.get(9)?,
             source: row.get(10)?,
+            reasoning: None,
+            reasoning_summary: None,
+            reasoning_tokens: row.get(11)?,
         })
     })?;
 

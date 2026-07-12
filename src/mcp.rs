@@ -315,6 +315,32 @@ fn tool_definitions(scope: &ServerScope) -> Value {
         }
     }));
 
+    tools.push(json!({
+        "name": "memory_facts",
+        "description": "Search durable facts distilled from past sessions (decisions, constraints, preferences, environment facts). Cheap and compact — prefer this over memory_search when you need established knowledge ('what did we decide about X', 'known gotchas for Y') rather than raw conversation history. Empty query lists the most recent facts.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "query":     { "type": "string", "description": "FTS search query (empty = most recent facts)" },
+                "workspace": { "type": "string", "description": "Filter to a workspace path (default: current workspace)" },
+                "limit":     { "type": "number", "description": "Max results (default 20)" }
+            }
+        }
+    }));
+
+    tools.push(json!({
+        "name": "memory_get_reasoning",
+        "description": "Fetch the stored chain-of-thought (reasoning) for ONE past memory entry by id. Search and session results deliberately omit reasoning to save tokens — they only flag it with has_reasoning=true and reasoning_tokens. Call this ONLY when you specifically need the reasoning behind a past entry (e.g. 'why did it decide that'). mode='summary' (default) returns a compressed version; mode='full' returns the raw CoT, which can be large.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id":   { "type": "number", "description": "Entry id from a search/session result where has_reasoning=true" },
+                "mode": { "type": "string", "description": "'summary' (default, compressed) or 'full' (raw CoT)" }
+            },
+            "required": ["id"]
+        }
+    }));
+
     // Antigravity 専用ツール
     if scope.client == "antigravity" || scope.default_source.as_deref() == Some("antigravity") {
         tools.push(json!({

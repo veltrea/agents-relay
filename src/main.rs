@@ -1,11 +1,13 @@
 mod client;
 mod config;
+mod consolidate;
 mod db;
 mod detect;
 mod export;
 mod ingest;
 mod ingest_antigravity;
 mod mcp;
+mod reasoning;
 mod server;
 mod session_hook;
 mod workspace;
@@ -37,6 +39,25 @@ enum Commands {
     Db {
         #[command(subcommand)]
         action: DbAction,
+    },
+
+    /// Distill finished sessions into summaries and durable facts (sleep-time consolidation)
+    Consolidate {
+        /// Max sessions to process per run
+        #[arg(long, default_value = "20")]
+        limit: i64,
+        /// Skip sessions with fewer user/assistant entries than this
+        #[arg(long, default_value = "6")]
+        min_entries: i64,
+        /// Only process sessions idle for at least this many minutes
+        #[arg(long, default_value = "60")]
+        idle_mins: i64,
+        /// Skip fact extraction (summaries only)
+        #[arg(long)]
+        no_facts: bool,
+        /// Also re-process sessions whose summary was made without the LLM
+        #[arg(long)]
+        upgrade: bool,
     },
 
     /// Archive old entries to Markdown
@@ -175,6 +196,19 @@ enum DbAction {
     Vacuum,
     /// Rebuild FTS index (use if search is broken)
     RebuildFts,
+    /// Export a lightweight copy (no chain-of-thought, no FTS payload)
+    ExportLight {
+        /// Output path (default: memory-light.db next to memory.db)
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Recover full text of previously-truncated entries from source JSONL files
+    BackfillFulltext,
+    /// Restore entries from a lossless archive JSONL (written by `archive`)
+    RestoreArchive {
+        /// Path to a .jsonl file under the archive directory
+        path: std::path::PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -264,7 +298,49 @@ fn main() -> Result<()> {
                 db::rebuild_fts(&conn)?;
                 println!("FTS index rebuilt.");
             }
+            DbAction::ExportLight { out } => {
+                let out = out.unwrap_or_else(|| db_path.with_file_name("memory-light.db"));
+                let count = db::export_light(&conn, &out)?;
+                let size_mb = std::fs::metadata(&out).map(|m| m.len() / 1_048_576).unwrap_or(0);
+                println!(
+                    "Exported {count} entries -> {} ({size_mb} MB)\n\
+                     Note: FTS index is empty. To search on the copy, run `db rebuild-fts` against it.",
+                    out.display()
+                );
+            }
+            DbAction::BackfillFulltext => {
+                let (filled, remaining, cot_filled) = ingest::backfill_fulltext(&mut conn)?;
+                println!("Backfilled {filled} full texts into fulltext.db.");
+                println!("Backfilled {cot_filled} chain-of-thought blocks into reasoning.db.");
+                if remaining > 0 {
+                    println!(
+                        "{remaining} truncated entries remain (source files no longer available)."
+                    );
+                }
+            }
+            DbAction::RestoreArchive { path } => {
+                let (restored, skipped) = export::restore_archive_jsonl(&conn, &path)?;
+                println!("Restored {restored} entries ({skipped} already present, skipped).");
+                if restored > 0 {
+                    println!("Note: run `db rebuild-fts` if search results look incomplete.");
+                }
+            }
         },
+
+        Commands::Consolidate { limit, min_entries, idle_mins, no_facts, upgrade } => {
+            let cfg = config::Config::load()?;
+            let stats = consolidate::run(&mut conn, &cfg, limit, min_entries, idle_mins, !no_facts, upgrade)?;
+            println!(
+                "Consolidated {} sessions ({} via LLM). Facts: +{} added, {} duplicates skipped.",
+                stats.sessions, stats.llm_summaries, stats.facts_added, stats.facts_skipped
+            );
+            if stats.sessions > 0 && stats.llm_summaries == 0 && cfg.reasoning_llm_enabled {
+                println!("Note: LLM unreachable — summaries used heuristic fallback. Re-run later to upgrade.");
+            }
+            if !cfg.reasoning_llm_enabled {
+                println!("Note: reasoning_llm_enabled=false — heuristic summaries only, no fact extraction.\n      Enable with: agents-relay config set reasoning_llm_enabled true");
+            }
+        }
 
         Commands::Archive { dry } => {
             let cfg = config::Config::load()?;
@@ -299,12 +375,23 @@ fn main() -> Result<()> {
                 }
                 let dir = archive_dir.join(parts[0]).join(parts[1]);
                 let file = dir.join(format!("{}.md", parts[2]));
+                let jsonl_file = dir.join(format!("{}.jsonl", parts[2]));
 
                 if dry {
-                    println!("[dry] Would archive {date} -> {}", file.display());
+                    println!(
+                        "[dry] Would archive {date} -> {} (+ lossless {})",
+                        file.display(),
+                        jsonl_file.display()
+                    );
                 } else {
-                    let md = export::export_date(&conn, date)?;
                     std::fs::create_dir_all(&dir)?;
+
+                    // 無損失 JSONL (全カラム + 生CoT + 全文原本)。削除より先に
+                    // fsync まで完了させる。追記方式なので再実行しても消えない。
+                    let exported = export::append_date_jsonl(&conn, date, &jsonl_file)?;
+
+                    // 人間用の Markdown ダイジェスト
+                    let md = export::export_date(&conn, date)?;
                     // クラッシュ後の再実行で二重書き出しにならないよう冪等化
                     if !file.exists() {
                         std::fs::write(&file, &md)?;
@@ -312,20 +399,30 @@ fn main() -> Result<()> {
                     // ファイル書き出し完了後にトランザクションで削除（BUG-004修正）
                     let tx = conn.transaction()?;
                     tx.execute(
+                        "DELETE FROM rdb.cot WHERE entry_id IN
+                             (SELECT id FROM raw_entries WHERE date = ?1)",
+                        rusqlite::params![date],
+                    )?;
+                    tx.execute(
+                        "DELETE FROM fdb.fulltext WHERE entry_id IN
+                             (SELECT id FROM raw_entries WHERE date = ?1)",
+                        rusqlite::params![date],
+                    )?;
+                    tx.execute(
                         "DELETE FROM raw_entries WHERE date = ?1",
                         rusqlite::params![date],
                     )?;
                     tx.commit()?;
-                    println!("Archived {date} -> {}", file.display());
+                    println!(
+                        "Archived {date}: {exported} entries -> {} (lossless) + {} (digest)",
+                        jsonl_file.display(),
+                        file.display()
+                    );
                 }
             }
 
             if !dry {
-                conn.execute_batch(
-                    "DELETE FROM raw_entries_fts;
-                     INSERT INTO raw_entries_fts (rowid, content, tool_name, session_id)
-                     SELECT id, content, tool_name, session_id FROM raw_entries;",
-                )?;
+                db::rebuild_fts(&conn)?;
                 println!("FTS index rebuilt.");
             }
         }
@@ -557,12 +654,52 @@ fn main() -> Result<()> {
                     let entries =
                         db::get_session_entries(&conn, sid, None, limit.unwrap_or(50))?;
                     for e in &entries {
-                        println!("[{}] {} {}: {}", e.id, e.time, e.entry_type, e.content);
+                        let ptr = e.reasoning_tokens
+                            .filter(|t| *t > 0)
+                            .map(|t| format!(" [has_reasoning ~{t}tok]"))
+                            .unwrap_or_default();
+                        println!("[{}] {} {}: {}{}", e.id, e.time, e.entry_type, e.content, ptr);
+                    }
+                }
+                // mode は query 引数で指定（"full" で生 CoT、それ以外は summary）
+                "memory_get_reasoning" => {
+                    let entry_id = id.unwrap_or(0);
+                    let mode = query.as_deref().unwrap_or("summary");
+                    match db::get_entry(&conn, entry_id)? {
+                        Some(e) => match e.reasoning {
+                            None => println!("id={entry_id}: no chain-of-thought stored."),
+                            Some(raw) => {
+                                if mode == "full" {
+                                    println!("id={entry_id} mode=full ({:?} tok)\n{raw}", e.reasoning_tokens);
+                                } else {
+                                    let (summary, kind) = match e.reasoning_summary {
+                                        Some(s) => (s, "cached"),
+                                        None => {
+                                            let c = config::Config::load().unwrap_or_default();
+                                            let llm = reasoning::LlmConfig {
+                                                enabled: c.reasoning_llm_enabled,
+                                                base_url: c.reasoning_llm_base_url,
+                                                model: c.reasoning_llm_model,
+                                                timeout_secs: c.reasoning_llm_timeout_secs,
+                                            };
+                                            let r = reasoning::summarize_best(&raw, Some(&llm));
+                                            db::set_reasoning_summary(&conn, entry_id, &r.text).ok();
+                                            (r.text, if r.used_llm { "llm" } else { "heuristic" })
+                                        }
+                                    };
+                                    println!(
+                                        "id={entry_id} mode=summary summarizer={kind} (summary~{}tok / full {:?}tok)\n{summary}",
+                                        reasoning::estimate_tokens(&summary), e.reasoning_tokens
+                                    );
+                                }
+                            }
+                        },
+                        None => println!("Not found."),
                     }
                 }
                 _ => {
                     println!("Unknown tool: {name}");
-                    println!("Available: memory_search, memory_get_entry, memory_get_session");
+                    println!("Available: memory_search, memory_get_entry, memory_get_session, memory_get_reasoning");
                     println!("Tip: use 'agents-relay list' for session listing.");
                 }
             }

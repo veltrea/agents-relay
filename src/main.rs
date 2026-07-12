@@ -61,6 +61,10 @@ enum Commands {
         /// Also re-process sessions whose summary was made without the LLM
         #[arg(long)]
         upgrade: bool,
+        /// Run continuously: drain the backlog, then idle-poll for new finished sessions.
+        /// Cadence and on/off are read live from config each cycle.
+        #[arg(long)]
+        watch: bool,
     },
 
     /// Archive old entries to Markdown
@@ -359,7 +363,12 @@ fn main() -> Result<()> {
             println!("Embedded {sums} summaries and {facts} facts (model: {}).", cfg.embedding_model);
         }
 
-        Commands::Consolidate { limit, min_entries, idle_mins, no_facts, upgrade } => {
+        Commands::Consolidate { limit, min_entries, idle_mins, no_facts, upgrade, watch } => {
+            if watch {
+                // 常時圧縮モード。設定を毎サイクル読み直しながら無限ループ。
+                consolidate::run_watch(&mut conn)?;
+                return Ok(());
+            }
             let cfg = config::Config::load()?;
             let stats = consolidate::run(&mut conn, &cfg, limit, min_entries, idle_mins, !no_facts, upgrade)?;
             println!(

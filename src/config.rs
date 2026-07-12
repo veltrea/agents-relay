@@ -30,6 +30,19 @@ pub struct Config {
     /// 空なら意味検索は無効。API は reasoning_llm_base_url を共用する。
     #[serde(default = "default_embedding_model")]
     pub embedding_model: String,
+    /// consolidate --watch (常時圧縮) を実行するか。false ならウォッチャは
+    /// 何もせず待機する (launchd を触らずに config だけで一時停止できる)。
+    #[serde(default = "default_consolidate_enabled")]
+    pub consolidate_enabled: bool,
+    /// --watch の 1 パスあたり処理セッション数。
+    #[serde(default = "default_consolidate_batch")]
+    pub consolidate_batch: i64,
+    /// --watch でバックログを消化中、パス間に空ける秒数。
+    #[serde(default = "default_consolidate_busy_secs")]
+    pub consolidate_busy_secs: u64,
+    /// --watch でバックログが空のとき、新しい終了セッションを待つポーリング間隔 (秒)。
+    #[serde(default = "default_consolidate_idle_secs")]
+    pub consolidate_idle_secs: u64,
 }
 
 fn default_retention_days() -> u32 {
@@ -78,6 +91,22 @@ fn default_embedding_model() -> String {
     String::new()
 }
 
+fn default_consolidate_enabled() -> bool {
+    true
+}
+
+fn default_consolidate_batch() -> i64 {
+    10
+}
+
+fn default_consolidate_busy_secs() -> u64 {
+    15
+}
+
+fn default_consolidate_idle_secs() -> u64 {
+    900
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -90,6 +119,10 @@ impl Default for Config {
             reasoning_llm_model: default_reasoning_llm_model(),
             reasoning_llm_timeout_secs: default_reasoning_llm_timeout_secs(),
             embedding_model: default_embedding_model(),
+            consolidate_enabled: default_consolidate_enabled(),
+            consolidate_batch: default_consolidate_batch(),
+            consolidate_busy_secs: default_consolidate_busy_secs(),
+            consolidate_idle_secs: default_consolidate_idle_secs(),
         }
     }
 }
@@ -165,6 +198,22 @@ impl Config {
             "embedding_model" => {
                 self.embedding_model = value.to_string();
             }
+            "consolidate_enabled" => {
+                self.consolidate_enabled = match value {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => anyhow::bail!("Invalid value for consolidate_enabled: {value} (use true/false)"),
+                };
+            }
+            "consolidate_batch" => {
+                self.consolidate_batch = value.parse()?;
+            }
+            "consolidate_busy_secs" => {
+                self.consolidate_busy_secs = value.parse()?;
+            }
+            "consolidate_idle_secs" => {
+                self.consolidate_idle_secs = value.parse()?;
+            }
             _ => {
                 anyhow::bail!("Unknown config key: {key}");
             }
@@ -184,7 +233,11 @@ impl Config {
              reasoning_llm_base_url:     {}\n\
              reasoning_llm_model:        {}\n\
              reasoning_llm_timeout_secs: {}\n\
-             embedding_model:            {}",
+             embedding_model:            {}\n\
+             consolidate_enabled:        {}\n\
+             consolidate_batch:          {}\n\
+             consolidate_busy_secs:      {}\n\
+             consolidate_idle_secs:      {}",
             Self::config_path().display(),
             self.enabled,
             self.retention_days,
@@ -194,7 +247,11 @@ impl Config {
             self.reasoning_llm_base_url,
             if self.reasoning_llm_model.is_empty() { "(auto-detect)" } else { &self.reasoning_llm_model },
             self.reasoning_llm_timeout_secs,
-            if self.embedding_model.is_empty() { "(disabled)" } else { &self.embedding_model }
+            if self.embedding_model.is_empty() { "(disabled)" } else { &self.embedding_model },
+            self.consolidate_enabled,
+            self.consolidate_batch,
+            self.consolidate_busy_secs,
+            self.consolidate_idle_secs
         )
     }
 }

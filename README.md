@@ -82,6 +82,11 @@ agents-relay config set reasoning_llm_enabled true
 agents-relay config set reasoning_llm_base_url http://localhost:1234/v1
 ```
 
+Scheduling is up to you — the work is a pure background batch over already-persisted data, so timing only affects freshness, never correctness (originals stay lossless and everything derived is regenerable). Two common policies:
+
+- **Continuous** — `agents-relay consolidate --watch` drains the backlog, then idle-polls for newly finished sessions. Cadence and on/off are read live from config each cycle (`consolidate_enabled`, `consolidate_batch`, `consolidate_busy_secs`, `consolidate_idle_secs`). Run it under launchd/systemd with restart-on-exit.
+- **Periodic** — a cron/launchd job running one-shot `agents-relay consolidate` (e.g. nightly).
+
 ### Semantic search (hybrid retrieval)
 
 FTS5 handles Japanese poorly (no word segmentation), so rephrased queries miss. Once an embedding model (e.g. bge-m3) is configured, `memory_search` augments FTS results with semantic neighbors from summaries and facts.
@@ -119,7 +124,11 @@ agents-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
   "reasoning_llm_model": "",                         // empty = auto-detect via /v1/models
   "reasoning_llm_timeout_secs": 120,
   "backup_dir": "~/.agents-relay/backups",           // output dir for db backup (separate disk recommended)
-  "embedding_model": ""                              // embedding model for semantic search (empty = disabled)
+  "embedding_model": "",                             // embedding model for semantic search (empty = disabled)
+  "consolidate_enabled": true,                       // master switch for `consolidate --watch`
+  "consolidate_batch": 10,                           // sessions per pass in watch mode
+  "consolidate_busy_secs": 15,                       // sleep between passes while draining
+  "consolidate_idle_secs": 900                       // poll interval when the backlog is empty
 }
 ```
 

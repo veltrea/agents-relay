@@ -97,6 +97,15 @@ MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[t
 
 原本は一切変更しない。要約・事実は再生成可能な派生物。
 
+### 5.1 スケジューリング（`--watch`）
+
+蒸留はすでに永続化されたデータへの純粋なバックグラウンドバッチなので、いつ回すかは鮮度に影響するだけで正しさには影響しない。2 つの方針をサポートする:
+
+- **常時圧縮**: `consolidate --watch` がループする — 新規 JSONL を sync し、1 パス（`consolidate_batch` 件）実行、埋め込み、処理があれば `consolidate_busy_secs`、空なら `consolidate_idle_secs` だけ sleep。設定は毎サイクル読み直すため、cadence と `consolidate_enabled` マスタースイッチはプロセス再起動なしで即反映される。launchd / systemd で「終了したら再起動」させて常駐する想定。ウォッチャは毎サイクル `sync_all` も回すので、`server` が動いていなくても自己完結する。
+- **定期実行**: cron / launchd でワンショット `consolidate` を呼ぶ。
+
+デプロイでは責務を分離する: KeepAlive デーモンが `consolidate --watch`（連続圧縮 + 埋め込み）を担い、日次ジョブが `db backup`（定期スナップショット）を担う。
+
 ## 6. MCP ツール
 
 | ツール | 概要 |
@@ -129,6 +138,10 @@ MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[t
 | `reasoning_llm_timeout_secs` | 120 | LLM 呼び出しタイムアウト |
 | `backup_dir` | `~/.agents-relay/backups` | `db backup` の出力先（別物理ディスク推奨） |
 | `embedding_model` | （空） | 意味検索用の埋め込みモデル。空なら無効 |
+| `consolidate_enabled` | true | `consolidate --watch` のマスタースイッチ |
+| `consolidate_batch` | 10 | watch の 1 パスあたり処理セッション数 |
+| `consolidate_busy_secs` | 15 | 消化中のパス間 sleep 秒 |
+| `consolidate_idle_secs` | 900 | バックログが空のときのポーリング間隔 (秒) |
 
 ## 9. バックアップと復元
 

@@ -97,6 +97,15 @@ MCP response `content` / `reasoning` is capped at 200,000 bytes (annotated with 
 
 Originals are never modified. Summaries and facts are regenerable derived artifacts.
 
+### 5.1 Scheduling (`--watch`)
+
+Because consolidation is a pure background batch over already-persisted data, when it runs only affects freshness, never correctness. Two policies are supported:
+
+- **Continuous**: `consolidate --watch` loops — sync new JSONL, run one pass (batch = `consolidate_batch`), embed, then sleep `consolidate_busy_secs` if it did work or `consolidate_idle_secs` if the backlog was empty. Config is re-read every cycle, so cadence and the `consolidate_enabled` master switch take effect live without restarting the process. Intended to run under launchd/systemd with restart-on-exit. The watcher also runs `sync_all` each cycle, so it is self-sufficient even when no `server` is active.
+- **Periodic**: a cron/launchd job invoking one-shot `consolidate`.
+
+Deployment separates responsibilities: a KeepAlive daemon runs `consolidate --watch` (continuous compression + embedding), while a daily job runs `db backup` (periodic snapshot).
+
 ## 6. MCP tools
 
 | Tool | Summary |
@@ -129,6 +138,10 @@ The server port can be overridden with the `AGENTS_RELAY_PORT` environment varia
 | `reasoning_llm_timeout_secs` | 120 | LLM call timeout |
 | `backup_dir` | `~/.agents-relay/backups` | Output directory for `db backup` (separate physical disk recommended) |
 | `embedding_model` | (empty) | Embedding model for semantic search; empty = disabled |
+| `consolidate_enabled` | true | Master switch for `consolidate --watch` |
+| `consolidate_batch` | 10 | Sessions per pass in watch mode |
+| `consolidate_busy_secs` | 15 | Sleep between passes while draining |
+| `consolidate_idle_secs` | 900 | Poll interval when the backlog is empty |
 
 ## 9. Backup and restore
 

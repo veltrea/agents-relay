@@ -82,6 +82,11 @@ agents-relay config set reasoning_llm_enabled true
 agents-relay config set reasoning_llm_base_url http://localhost:1234/v1
 ```
 
+いつ回すかは自由です。すでに永続化されたデータに対する純粋なバックグラウンドバッチなので、タイミングは鮮度に影響するだけで正しさには一切影響しません（原本は無損失、派生物はすべて再生成可能）。代表的な 2 つの方針:
+
+- **常時圧縮** — `agents-relay consolidate --watch` がバックログを消化し、空になったら新しい終了セッションをポーリングで待ちます。cadence と on/off は毎サイクル config から読み直します（`consolidate_enabled` / `consolidate_batch` / `consolidate_busy_secs` / `consolidate_idle_secs`）。launchd / systemd で「終了したら再起動」で常駐させます。
+- **定期実行** — cron / launchd でワンショットの `agents-relay consolidate` を回す（例: 毎晩）。
+
 ### 意味検索（ハイブリッド検索）
 
 FTS5 は日本語の分かち書きに弱く、言い回しが違うと当たりません。埋め込みモデル（bge-m3 等）を設定すると、`memory_search` が FTS の結果に加えて要約・事実の意味的近傍を返すようになります。
@@ -119,7 +124,11 @@ agents-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
   "reasoning_llm_model": "",                         // empty = auto-detect via /v1/models
   "reasoning_llm_timeout_secs": 120,
   "backup_dir": "~/.agents-relay/backups",           // output dir for db backup (separate disk recommended)
-  "embedding_model": ""                              // embedding model for semantic search (empty = disabled)
+  "embedding_model": "",                             // embedding model for semantic search (empty = disabled)
+  "consolidate_enabled": true,                       // master switch for `consolidate --watch`
+  "consolidate_batch": 10,                           // sessions per pass in watch mode
+  "consolidate_busy_secs": 15,                       // sleep between passes while draining
+  "consolidate_idle_secs": 900                       // poll interval when the backlog is empty
 }
 ```
 

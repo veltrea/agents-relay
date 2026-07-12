@@ -114,6 +114,55 @@ pub fn run(
     Ok(stats)
 }
 
+/// 常時圧縮モード。バックログを消化し、空になったらポーリング間隔で待つ。
+/// 設定は毎サイクル読み直すので、config だけで cadence 変更・一時停止できる。
+/// SIGTERM (launchd 停止) で素直に終了する。
+pub fn run_watch(conn: &mut Connection) -> Result<()> {
+    eprintln!("agents-relay: consolidate watcher started");
+    loop {
+        // 設定を毎回読み直す (live tuning)。読めなければ既定値。
+        let cfg = Config::load().unwrap_or_default();
+
+        if !cfg.consolidate_enabled {
+            std::thread::sleep(std::time::Duration::from_secs(cfg.consolidate_idle_secs));
+            continue;
+        }
+
+        // 新しいセッションを取り込む (server が動いていなくても自己完結するため)。
+        // オフセット方式なので新規分が無ければほぼ無コスト。
+        if let Err(e) = crate::ingest::sync_all(conn) {
+            eprintln!("agents-relay: watcher sync failed: {e}");
+        }
+
+        let stats = match run(
+            conn,
+            &cfg,
+            cfg.consolidate_batch,
+            6,    // min_entries
+            60,   // idle_mins: 終了とみなす閾値
+            true, // with_facts
+            true, // upgrade: LLM 復帰後にヒューリスティック要約を自己修復
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("agents-relay: consolidate pass failed: {e}");
+                // LLM 一時不達などは長めに待って再試行
+                std::thread::sleep(std::time::Duration::from_secs(cfg.consolidate_idle_secs));
+                continue;
+            }
+        };
+
+        // 処理があれば短い間隔で次パスへ (バックログを速やかに消化)。
+        // 空なら新しい終了セッションを待つポーリング間隔で休む。
+        let sleep_secs = if stats.sessions > 0 {
+            cfg.consolidate_busy_secs
+        } else {
+            cfg.consolidate_idle_secs
+        };
+        std::thread::sleep(std::time::Duration::from_secs(sleep_secs));
+    }
+}
+
 /// セッションの user/assistant 発言を LLM 予算内のダイジェストに畳む。
 /// 予算超過時は先頭 60% + 末尾 40% を残し中間を省略する
 /// (セッションの目的は冒頭に、結末は末尾に現れやすいため)。

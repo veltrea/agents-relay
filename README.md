@@ -1,138 +1,138 @@
-# agents-relay: AI コーディングエージェントのセッション記憶
+# agents-relay: Session Memory for AI Coding Agents
 
-**Read this in other languages:** [English](README.en.md)
+**Read this in other languages:** [日本語](README.ja.md)
 
-Claude Code と Antigravity のセッション履歴を SQLite に取り込み、MCP ツールとして「過去の記憶」を提供するシングルバイナリです。旧名 claude-relay。マルチエージェント対応にあわせて改名しました。
+A single binary that ingests Claude Code and Antigravity session history into SQLite and serves "past memory" as MCP tools. Formerly claude-relay; renamed when it went multi-agent.
 
-## 経緯
+## Background
 
-[claude-mem](https://github.com/anthropics/claude-mem)（Claude Code のセッション記憶プラグイン）をローカル LLM で使えるようにしようとフォークしてソースコードを読んだところ、正直なところ使い物になりませんでした。
+I forked [claude-mem](https://github.com/anthropics/claude-mem) (a session memory plugin for Claude Code) intending to make it work with local LLMs, but after reading through the source code, I honestly found it unusable.
 
-1件のツール使用ごとに AI 圧縮リクエストを飛ばす設計、タイムアウトなしの fetch、リトライ戦略の欠如、liveness と readiness の混同、圧縮後に生データを捨てる不可逆な処理 — コンピュータサイエンスの基礎が押さえられていない実装でした。詳しくは[別の記事](https://note.com/veltrea/n/n791d1defada0)に書いています。
+Firing an AI compression request per tool use, fetches without timeouts, no retry strategy, confusing liveness with readiness, and irreversibly discarding raw data after compression — the fundamentals of computer science just weren't there. I wrote more about it in [a separate article](https://note.com/veltrea/n/n791d1defada0).
 
-で、考えてみたら取り込み時に AI で圧縮する必要なんてそもそもないんですよね。Claude Code は全セッションデータを `~/.claude/projects/` に JSONL で書き出しています。これを SQLite に**無損失で**突っ込んで、要約や圧縮は「あとから・何度でも作り直せる派生物」として扱えばいい。
+Then it hit me: there is no reason to compress with AI at ingest time in the first place. Claude Code already writes every session to `~/.claude/projects/` as JSONL. Load that into SQLite **losslessly**, and treat summaries and compression as derived artifacts you can regenerate at any time.
 
-そういうわけでゼロから作ったのがこれです。
+So I built this from scratch.
 
-## 設計原則
+## Design principles
 
-1. **原本は絶対に失わない。** 取り込みで切り詰めない。削除の前には必ず無損失エクスポート。要約アルゴリズムを将来差し替えても、原本から何度でも再生成できる。
-2. **トークン節約は保存側でなく提示側で行う。** 検索結果には長大データ（思考過程・巨大本文）を含めず、ポインタだけ返す。エージェントが必要と判断したときだけ専用ツールで取りに行く。
-3. **デーモン不要。** MCP ツール呼び出し時にバイトオフセットで差分取り込み。
+1. **Never lose the original.** No truncation at ingest. Every deletion is preceded by a lossless export. Swap the summarization algorithm later and regenerate everything from the originals.
+2. **Save tokens on the presentation side, not the storage side.** Search results carry pointers instead of bulky data (chains of thought, huge bodies). Agents fetch the full data with a dedicated tool only when they decide they need it.
+3. **No daemons.** Incremental ingest by byte offset whenever an MCP tool is called.
 
-## ストレージ構成（3 層 + 派生物）
+## Storage layout (three tiers + derived artifacts)
 
-| ファイル | 中身 | 消してよいか |
+| File | Contents | Safe to delete? |
 |---|---|---|
-| `memory.db` | エントリ本体（inline）+ FTS 索引 + 要約 + 事実 | 不可（本体） |
-| `fulltext.db` | 50KB 超の本文の**全文原本** | 消すと全文が失われる |
-| `reasoning.db` | 生 chain-of-thought（thinking）の原本 | 消しても検索は無傷 |
-| `archive/YYYY/MM/DD.jsonl` | アーカイブ済みエントリの無損失原本（追記専用） | 消すと復元不能 |
-| `vectors.db` | 要約・事実の埋め込みベクトル（意味検索用） | `embed` で再生成可 |
-| `memory-light.db` | `db export-light` の派生物（持ち出し用） | いつでも再生成可 |
+| `memory.db` | Entry bodies (inline) + FTS index + summaries + facts | No (the core) |
+| `fulltext.db` | **Full original text** of bodies over 50KB | Deleting loses full texts |
+| `reasoning.db` | Raw chain-of-thought (thinking) originals | Search survives deletion |
+| `archive/YYYY/MM/DD.jsonl` | Lossless originals of archived entries (append-only) | Deleting loses restore data |
+| `vectors.db` | Embedding vectors of summaries/facts (semantic search) | Regenerable via `embed` |
+| `memory-light.db` | Derived output of `db export-light` (for transport) | Regenerable anytime |
 
-## インストール
+## Install
 
-Rust のビルド環境が必要です。
+Requires a Rust build environment.
 
 ```bash
 git clone https://github.com/veltrea/agents-relay.git
 cd agents-relay
 cargo build --release
 
-# Claude Code の MCP に登録
+# Register with Claude Code as an MCP server
 claude mcp add --transport stdio --scope user agents-relay -- $(pwd)/target/release/agents-relay serve
 ```
 
-## 使い方
+## Usage
 
-### Claude Code / Antigravity から使う
+### From Claude Code / Antigravity
 
-MCP ツールとして登録すれば、セッション内で普通に聞くだけです。取り込みはツール呼び出し時に自動で走ります。
+Register it as an MCP server and just ask inside a session. Ingest runs automatically on tool calls.
 
-- 「昨日の作業内容を教えて」
-- 「OAuth 修正した時のやつ探して」
-- 「このプロジェクトで何を決めたっけ？」（→ `memory_facts` が蒸留済みの決定・制約を返す）
-- 「あのときなぜその設計にした？」（→ `memory_get_reasoning` が当時の思考過程を返す）
+- "What did I work on yesterday?"
+- "Find the session where we fixed OAuth"
+- "What did we decide in this project?" (→ `memory_facts` returns distilled decisions and constraints)
+- "Why did we choose that design back then?" (→ `memory_get_reasoning` returns the chain of thought from that moment)
 
-主な MCP ツール:
+Main MCP tools:
 
-| ツール | 用途 |
+| Tool | Purpose |
 |---|---|
-| `memory_search` | FTS 全文検索（workspace 名・ブランチ名でも当たる） |
-| `memory_list_sessions` | セッション一覧（蒸留済みなら要約スニペット付き） |
-| `memory_get_session` | セッション全文（要約が先頭に付く） |
-| `memory_get_entry` | 1 エントリの全文（fulltext 原本から） |
-| `memory_get_reasoning` | 保存された思考過程（summary / full） |
-| `memory_facts` | 蒸留済みの持続的事実（低トークン） |
+| `memory_search` | FTS full-text search (also matches workspace and branch names) |
+| `memory_list_sessions` | Session list (with summary snippets once consolidated) |
+| `memory_get_session` | Full session history (session summary prepended) |
+| `memory_get_entry` | Full text of one entry (from the fulltext originals) |
+| `memory_get_reasoning` | Stored chain of thought (summary / full) |
+| `memory_facts` | Distilled durable facts (very low token cost) |
 
-### 睡眠時整理（要約と事実の蒸留）
+### Sleep-time consolidation (distilling summaries and facts)
 
-終了したセッションをローカル LLM（LM Studio 等 OpenAI 互換 API）で蒸留します。LLM が落ちていれば抽出圧縮にフォールバックし、後から `--upgrade` で格上げできます。
+Finished sessions are distilled with a local LLM (LM Studio or any OpenAI-compatible API). If the LLM is unreachable, it falls back to extractive compression, upgradeable later with `--upgrade`.
 
 ```bash
-# 直近の終了セッションを蒸留（要約 + 事実抽出）
+# Distill recently finished sessions (summary + fact extraction)
 agents-relay consolidate
 
-# ヒューリスティック要約を LLM 要約に格上げ
+# Upgrade heuristic summaries to LLM summaries
 agents-relay consolidate --upgrade
 
-# LLM を有効化（既定はオフ）
+# Enable the LLM (off by default)
 agents-relay config set reasoning_llm_enabled true
 agents-relay config set reasoning_llm_base_url http://localhost:1234/v1
 ```
 
-### 意味検索（ハイブリッド検索）
+### Semantic search (hybrid retrieval)
 
-FTS5 は日本語の分かち書きに弱く、言い回しが違うと当たりません。埋め込みモデル（bge-m3 等）を設定すると、`memory_search` が FTS の結果に加えて要約・事実の意味的近傍を返すようになります。
+FTS5 handles Japanese poorly (no word segmentation), so rephrased queries miss. Once an embedding model (e.g. bge-m3) is configured, `memory_search` augments FTS results with semantic neighbors from summaries and facts.
 
 ```bash
 agents-relay config set embedding_model text-embedding-bge-m3
-agents-relay embed   # 既存の要約・事実をベクトル化（以後は consolidate が自動で埋め込む）
+agents-relay embed   # embed existing summaries/facts (consolidate embeds new ones automatically)
 ```
 
-### 管理 CLI
+### Admin CLI
 
 ```bash
-agents-relay db stats             # 件数・DB 別サイズ
-agents-relay db backup            # 3 DB を backup_dir へ整合スナップショット（世代ローテーション）
-agents-relay db backfill-fulltext # 過去に切り詰めた本文・CoT を元 JSONL から回収
-agents-relay db export-light      # 軽量コピー生成（持ち出し用）
-agents-relay db rebuild-fts       # FTS 索引の再構築
-agents-relay archive              # 期限切れエントリを無損失 JSONL + Markdown にアーカイブして削除
-agents-relay db restore-archive ~/.agents-relay/archive/2026/01/05.jsonl  # アーカイブから復元
+agents-relay db stats             # counts and per-database sizes
+agents-relay db backup            # consistent snapshot of the 3 DBs to backup_dir (with rotation)
+agents-relay db backfill-fulltext # recover truncated bodies / CoT from source JSONL
+agents-relay db export-light      # generate a lightweight copy (for transport)
+agents-relay db rebuild-fts       # rebuild the FTS index
+agents-relay archive              # archive expired entries to lossless JSONL + Markdown, then delete
+agents-relay db restore-archive ~/.agents-relay/archive/2026/01/05.jsonl  # restore from an archive
 agents-relay list --date 2026-07-12
 agents-relay export <session_id>
 agents-relay query "SELECT type, COUNT(*) FROM raw_entries GROUP BY type"
 ```
 
-## 設定
+## Configuration
 
 `~/.agents-relay/config.json`:
 
 ```jsonc
 {
-  "retention_days": 30,                              // archive の対象になる日数
+  "retention_days": 30,                              // days before entries become archive targets
   "archive_dir": "~/.agents-relay/archive",
-  "reasoning_llm_enabled": false,                    // consolidate / CoT 要約に LLM を使うか
+  "reasoning_llm_enabled": false,                    // use the LLM for consolidate / CoT summaries
   "reasoning_llm_base_url": "http://localhost:1234/v1",
-  "reasoning_llm_model": "",                         // 空なら /v1/models から自動検出
+  "reasoning_llm_model": "",                         // empty = auto-detect via /v1/models
   "reasoning_llm_timeout_secs": 120,
-  "backup_dir": "~/.agents-relay/backups",           // db backup の出力先（別ディスク推奨）
-  "embedding_model": ""                              // 意味検索用の埋め込みモデル（空 = 無効）
+  "backup_dir": "~/.agents-relay/backups",           // output dir for db backup (separate disk recommended)
+  "embedding_model": ""                              // embedding model for semantic search (empty = disabled)
 }
 ```
 
-設計の詳細は [SPEC.md](SPEC.md) を参照してください。
+See [SPEC.md](SPEC.md) for design details.
 
-## 注意事項
+## Caveats
 
-自分の環境（macOS）で動かすために作っているものです。他の環境は試していません。
+Built to run on my own machine (macOS). Other environments are untested.
 
-バグを見つけた方、動かなかった方は [Issue](https://github.com/veltrea/agents-relay/issues) で教えてもらえると助かります。
+If you find a bug or it doesn't work for you, an [Issue](https://github.com/veltrea/agents-relay/issues) would be appreciated.
 
-PR は受け付けていません。思いついたら丸ごとコードを書き換えるタイプなので、PR をもらっても元のコードが残っていない可能性が高いです。気になった方はフォークして自由にやってください。
+PRs are not accepted. I tend to rewrite the whole thing whenever an idea strikes, so your PR's base code probably won't survive. Feel free to fork and do whatever you like.
 
-## ライセンス
+## License
 
 MIT License

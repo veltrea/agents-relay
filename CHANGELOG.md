@@ -1,57 +1,57 @@
 # Changelog
 
-**Read this in other languages:** [English](CHANGELOG.en.md)
+**Read this in other languages:** [日本語](CHANGELOG.ja.md)
 
 ## [0.2.1] - 2026-07-12
 
-### 無損失 3 層ストレージ
+### Lossless three-tier storage
 
-「原本は絶対に失わない。トークン節約は提示側で行う」を原則に、ストレージを 3 層に分離しました。
+Storage was split into three tiers around one principle: never lose the original; save tokens on the presentation side.
 
-- 生 CoT（thinking）を `reasoning.db`（`rdb.cot`）に分離。`memory.db` 側は概算トークン数のポインタのみ保持
-- 50KB 超の本文は先頭 1KB + マーカーを inline 保存し、全文を `fulltext.db`（`fdb.fulltext`）へ無損失退避。FTS は inline のみ索引
-- 取り込み時の切り詰め（content 50KB / reasoning 200KB / antigravity 48KB）を全廃し、ポリシーを `db::insert_entry_full` に集約
-- `db backfill-fulltext`: 過去に切り詰められた本文と、旧版が捨てていた thinking を元 JSONL / `.jsonl.bak` から回収（冪等）
-- `db export-light`: CoT・FTS 実体抜きの軽量コピーを一方向生成（持ち出し・バックアップ用。`db rebuild-fts` で完全復元）
-- `archive` は削除前に「全カラム + 生 CoT + 全文原本」の無損失 JSONL を fsync まで書き出す方式に変更（追記専用）
-- `db restore-archive <file.jsonl>`: アーカイブからの冪等復元
-- `db rebuild-fts` が通常の FTS5 テーブルで常に失敗していた問題を修正（`'delete-all'` は contentless 専用のため DROP + CREATE 方式に）
-- 更新時の削除で FTS に幽霊行が残る問題を修正（分離 DB も含めて同期削除）
+- Raw chain-of-thought (thinking) moved to `reasoning.db` (`rdb.cot`); `memory.db` keeps only an estimated-token pointer
+- Content larger than 50KB keeps a 1KB inline head + marker while the full text is preserved losslessly in `fulltext.db` (`fdb.fulltext`); FTS indexes the inline part only
+- All ingest-side truncation (content 50KB / reasoning 200KB / antigravity 48KB) removed; the policy is centralized in `db::insert_entry_full`
+- `db backfill-fulltext`: recovers previously-truncated content and thinking that older versions discarded, from source JSONL / `.jsonl.bak` files (idempotent)
+- `db export-light`: one-way lightweight copy without CoT or FTS payload (for backup/transport; fully restorable via `db rebuild-fts`)
+- `archive` now writes a lossless JSONL (all columns + raw CoT + full text) and fsyncs it before deleting rows (append-only)
+- `db restore-archive <file.jsonl>`: idempotent restore from an archive
+- Fixed `db rebuild-fts` always failing on regular FTS5 tables (`'delete-all'` is contentless-only; switched to DROP + CREATE)
+- Fixed ghost FTS rows left behind by update-time deletes (side databases are now deleted in sync)
 
-### 睡眠時整理（consolidate）
+### Sleep-time consolidation (`consolidate`)
 
-- `consolidate`: 終了したセッションをローカル LLM（LM Studio 等 OpenAI 互換）で要約し `summaries` へ保存。LLM 不達時は抽出圧縮にフォールバックし、`--upgrade` で後から LLM 要約に格上げ可能
-- 持続的事実（DECISION / CONSTRAINT / PREFERENCE / ENVIRONMENT）を抽出して `facts` テーブルへ蓄積。文字バイグラム Jaccard >= 0.6 の新規性ゲートで既知の事実を排除、削除ではなく `superseded_by` で失効管理
-- MCP ツール `memory_facts` を追加（蒸留済み事実の検索。生ログ検索よりはるかに低トークン）
-- `memory_list_sessions` に要約スニペット、`memory_get_session` の先頭にセッション要約を付与
+- `consolidate`: distills finished sessions into the `summaries` table using a local LLM (LM Studio or any OpenAI-compatible server), falling back to extractive compression when the LLM is unreachable; `--upgrade` re-processes heuristic summaries later
+- Durable facts (DECISION / CONSTRAINT / PREFERENCE / ENVIRONMENT) are extracted into a `facts` table; a character-bigram Jaccard novelty gate (>= 0.6) drops facts that are already known, and supersession is tracked via `superseded_by` instead of deletion
+- New MCP tool `memory_facts` (searches distilled facts — far cheaper than raw-log search)
+- `memory_list_sessions` returns a summary snippet; `memory_get_session` prepends the session summary
 
-### 検索
+### Search
 
-- FTS に `context` 列（workspace 名 + git branch + source）を追加。プロジェクト名やブランチ名でも過去の記憶を検索可能に（contextual retrieval の軽量版）
+- Added a `context` column (workspace basename + git branch + source) to the FTS index, so past memory is searchable by project or branch name (a lightweight take on contextual retrieval)
 
-### Antigravity 取り込み強化
+### Richer Antigravity ingest
 
-- `agyhub_summaries_proto.pb`（平文 protobuf・手書き wire format パーサ）から全会話のタイトル・workspace・時刻を取り込み。brain が空のセッションも検索可能に
-- `.system_generated/logs/transcript.jsonl` の増分取り込み（実際の user / assistant / tool ロール付き）
-- `knowledge/<topic>/`（蒸留済みナレッジ）の取り込み
-- アーティファクト変更検知にサイズ + mtime を併用（同サイズ置換の見逃しを解消）
+- Parses `agyhub_summaries_proto.pb` (plain protobuf, hand-written wire-format reader) for every conversation's title, workspace, and timestamps — sessions with empty brain directories become searchable
+- Incremental ingest of `.system_generated/logs/transcript.jsonl` with real user / assistant / tool roles
+- Ingests `knowledge/<topic>/` (distilled knowledge base)
+- Artifact change detection uses size + mtime (same-size rewrites are no longer missed)
 
 ### MCP
 
-- `memory_get_entry` / `memory_get_reasoning` の転送を 200KB でキャップ（DB 内の原本は無損失のまま）
+- `memory_get_entry` / `memory_get_reasoning` transport is capped at 200KB (stored data remains lossless)
 
-### 意味検索（ハイブリッド検索）
+### Semantic search (hybrid retrieval)
 
-- sqlite-vec + OpenAI 互換 `/embeddings` による埋め込み層 `vectors.db` を追加（完全な派生物）
-- `memory_search` が FTS 結果に要約・事実の意味的近傍（`match: "semantic"`）を付加。FTS5 が日本語の言い回し違いで取りこぼすケースを補完
-- `embed` コマンド（一括バックフィル）。`consolidate` は新規分を自動埋め込み
-- 設定キー `embedding_model` を追加（空 = 無効）
+- Added an embedding tier `vectors.db` powered by sqlite-vec + an OpenAI-compatible `/embeddings` endpoint (fully derived)
+- `memory_search` augments FTS results with semantic neighbors of summaries and facts (`match: "semantic"`), covering the rephrasings that FTS5 misses on Japanese text
+- New `embed` command (bulk backfill); `consolidate` embeds new items automatically
+- New config key `embedding_model` (empty = disabled)
 
-### 運用
+### Operations
 
-- `db backup`: 3 DB を `VACUUM INTO` で整合スナップショット化し `backup_dir` に世代管理保存（`--keep N`）
-- 設定キー `backup_dir` を追加
-- サーバーポートを `AGENTS_RELAY_PORT` 環境変数で上書き可能に（テスト用）
+- `db backup`: consistent snapshots of all three databases via `VACUUM INTO` under `backup_dir`, with rotation (`--keep N`)
+- New config key `backup_dir`
+- Server port can be overridden with the `AGENTS_RELAY_PORT` environment variable (for tests)
 
 ---
 
@@ -59,48 +59,48 @@
 
 ### Breaking Changes
 
-- `agents-relay serve` は単体で DB を持たなくなりました。起動時に HTTP バックエンドサーバー (`agents-relay server`) を自動起動します。
-- 環境変数が `CLAUDE_RELAY_WORKSPACE` → `AGENTS_RELAY_WORKSPACE` に変更されました。
+- `agents-relay serve` no longer owns the DB by itself. It auto-starts the HTTP backend server (`agents-relay server`) on startup.
+- Environment variable renamed: `CLAUDE_RELAY_WORKSPACE` → `AGENTS_RELAY_WORKSPACE`.
 
-### Architecture: Server/Client 分離
+### Architecture: Server/Client split
 
-antigravity-relay の設計を移植し、単一プロセス方式から Server/Serve 分離方式に全面移行しました。
+Ported the antigravity-relay design, moving fully from a single-process model to a Server/Serve split.
 
 ```
-以前: serve(WS1), serve(WS2), serve(WS3) がそれぞれ SQLite に直接書き込み
-         → 複数ワークスペース同時起動で BUSY エラーのリスク
+Before: serve(WS1), serve(WS2), serve(WS3) each wrote directly to SQLite
+         → risk of BUSY errors with multiple concurrent workspaces
 
-以後: serve(WS1) ─┐
-      serve(WS2) ─┼─→ HTTP:54322 → server(1プロセス) → SQLite
-      serve(WS3) ─┘
-         → 全書き込みが直列化され BUSY エラーを根絶
+After:  serve(WS1) ─┐
+        serve(WS2) ─┼─→ HTTP:54322 → server (single process) → SQLite
+        serve(WS3) ─┘
+         → all writes serialized; BUSY errors eliminated
 ```
 
-#### 新規ファイル
+#### New files
 
-- **`src/server.rs`** — Axum HTTP サーバー (`127.0.0.1:54322`)
-  - `/health` `/register` `/deregister` `/tool` エンドポイント
-  - 全ツールロジックを DB と共に一手管理
-  - 起動後500msで初回 sync、以後30秒ごとにバックグラウンド差分同期
-  - serve プロセスが0かつ `pgrep` でも検出されない状態が約60秒続くと自動終了
-  - バイナリ更新検知で古いサーバーを自動再起動
+- **`src/server.rs`** — Axum HTTP server (`127.0.0.1:54322`)
+  - `/health` `/register` `/deregister` `/tool` endpoints
+  - Owns all tool logic together with the DB
+  - First sync 500ms after startup, then background incremental sync every 30 seconds
+  - Auto-exits after ~60 seconds with zero serve processes and no `pgrep` match
+  - Detects binary updates and restarts stale servers automatically
 
-- **`src/client.rs`** — HTTP クライアントユーティリティ
-  - `ensure_server_running()`: サーバーが落ちていれば自動起動・接続
-  - `call_tool()`: ツール呼び出しを HTTP で転送、失敗時に自動リトライ
-  - `register()` / `deregister()`: 接続数カウント管理
-  - ポート番号は `~/.agents-relay/server.port` で管理（デフォルト 54322）
+- **`src/client.rs`** — HTTP client utilities
+  - `ensure_server_running()`: starts and connects to the server if it is down
+  - `call_tool()`: forwards tool calls over HTTP with automatic retry
+  - `register()` / `deregister()`: connection-count management
+  - Port number managed via `~/.agents-relay/server.port` (default 54322)
 
-#### 変更ファイル
+#### Changed files
 
-- **`src/mcp.rs`** — thin proxy に変更
-  - DB への直接アクセスを完全撤廃
-  - `ServerScope`・`WorkspaceConfig`・cross-scope ゲートロジックは serve 側に維持
-  - `memory_unlock_cross_scope` はサーバー呼び出し不要のため serve 内で完結
-  - スコープ解決（workspace/source の確定）を serve 側で行い、解決済み値をサーバーに送信
+- **`src/mcp.rs`** — became a thin proxy
+  - Direct DB access fully removed
+  - `ServerScope`, `WorkspaceConfig`, and the cross-scope gate logic remain on the serve side
+  - `memory_unlock_cross_scope` completes within serve (no server call needed)
+  - Scope resolution (workspace/source) happens on the serve side; resolved values are sent to the server
 
-- **`src/main.rs`** — `server` サブコマンドを追加
-- **`Cargo.toml`** — `axum 0.7`・`reqwest 0.12` を追加
+- **`src/main.rs`** — added the `server` subcommand
+- **`Cargo.toml`** — added `axum 0.7` and `reqwest 0.12`
 
 ---
 
@@ -108,42 +108,42 @@ antigravity-relay の設計を移植し、単一プロセス方式から Server/
 
 ### Bug Fixes
 
-- **BUG-001/002: クラッシュ時の重複挿入・FTS不整合を修正** (`src/ingest.rs`)
-  - `ingest_file` 全体をトランザクション化（100件ごとにバッチコミット）
-  - オフセット保存も同一トランザクション内で行い、クラッシュ時の重複取り込みを防止
-  - `raw_entries` と `raw_entries_fts` の2つのINSERTが分断されないよう保護
+- **BUG-001/002: duplicate inserts and FTS inconsistency on crash** (`src/ingest.rs`)
+  - Wrapped `ingest_file` in a transaction (batch commit every 100 entries)
+  - Offset persistence happens inside the same transaction, preventing duplicate ingestion after a crash
+  - The two INSERTs into `raw_entries` and `raw_entries_fts` can no longer be torn apart
 
-- **BUG-003: Windows CRLF ファイルでオフセットがズレる問題を修正** (`src/ingest.rs`)
-  - `lines()` イテレータ（改行を除去してしまう）を `read_line()` に置き換え
-  - 実際に読み込んだバイト数でオフセットを計算するため、CRLF (`\r\n`) でも正確に差分追跡できる
+- **BUG-003: offset drift on Windows CRLF files** (`src/ingest.rs`)
+  - Replaced the `lines()` iterator (which strips newlines) with `read_line()`
+  - Offsets are computed from actual bytes read, so CRLF (`\r\n`) files track correctly
 
-- **BUG-004: archive コマンドの途中クラッシュで DB とファイルが不整合になる問題を修正** (`src/main.rs`)
-  - `DELETE FROM raw_entries` をトランザクションで保護
-  - アーカイブファイルの書き出しを冪等化（既存ファイルがあれば上書きしない）
-  - `stmt` の借用を `Vec` に収集してから解放することで `conn.transaction()` を安全に呼び出せるよう修正
+- **BUG-004: DB/file inconsistency when `archive` crashes midway** (`src/main.rs`)
+  - `DELETE FROM raw_entries` is protected by a transaction
+  - Archive file writes are idempotent (existing files are not overwritten)
+  - Collected `stmt` borrows into a `Vec` before release so `conn.transaction()` can be called safely
 
-- **BUG-005: workspace フィルタの LIKE クエリで特殊文字が誤動作する問題を修正** (`src/db.rs`)
-  - workspace パスに含まれる `%`・`_`・`\` を `ESCAPE '\\'` でエスケープ
-  - `search()` と `list_sessions()` の両方に適用
+- **BUG-005: LIKE queries misbehaving on special characters in workspace filters** (`src/db.rs`)
+  - `%`, `_`, and `\` in workspace paths are escaped with `ESCAPE '\\'`
+  - Applied to both `search()` and `list_sessions()`
 
-- **BUG-006: `code` を含むプロセス名を VS Code と誤検知する問題を修正** (`src/detect.rs`)
-  - `contains("code")` を完全一致・前方一致に変更（`recode`・`xcode` などの誤検知を解消）
-  - 条件: `n == "code" || n.starts_with("code ") || n.starts_with("code-server") || n.contains("vscode") || n == "codium"`
-  - リグレッション防止のためのユニットテストを追加
+- **BUG-006: process names containing `code` misdetected as VS Code** (`src/detect.rs`)
+  - Changed `contains("code")` to exact/prefix matching (no more false positives on `recode`, `xcode`, etc.)
+  - Condition: `n == "code" || n.starts_with("code ") || n.starts_with("code-server") || n.contains("vscode") || n == "codium"`
+  - Added a unit test to prevent regressions
 
-- **BUG-007: `memory_get_entry` の `id` パラメータが float で渡されると取得できない問題を修正** (`src/mcp.rs`)
-  - AI クライアントが `3.0` のように float で送ってくる場合に `as_f64()` フォールバックで対応
-  - `memory_search` / `memory_list_sessions` / `memory_get_session` では既に対応済みだったが `memory_get_entry` のみ漏れていた
+- **BUG-007: `memory_get_entry` failing when `id` arrives as a float** (`src/mcp.rs`)
+  - AI clients sometimes send `3.0`; handled with an `as_f64()` fallback
+  - `memory_search` / `memory_list_sessions` / `memory_get_session` already handled this; only `memory_get_entry` was missing it
 
-- **BUG-009: workspace スコープ時に `cwd IS NULL` のエントリが除外される問題を修正** (`src/db.rs`)
-  - `LIKE` 条件に `OR cwd IS NULL` を追加し、cwd を持たないエントリもスコープ内に含める
-  - BUG-005 の修正と同時に `search()` と `list_sessions()` の両方に適用
+- **BUG-009: entries with `cwd IS NULL` excluded under workspace scoping** (`src/db.rs`)
+  - Added `OR cwd IS NULL` to the `LIKE` condition so entries without a cwd stay in scope
+  - Applied to both `search()` and `list_sessions()` together with the BUG-005 fix
 
 ### Internal Changes
 
-- `ingest_file` / `ingest_dir` / `sync_all` のシグネチャを `&Connection` → `&mut Connection` に変更
-- `ingest_antigravity::sync_all` / `ingest_brain` / `ingest_session` も同様に変更
-- `mcp::serve` / `handle_request` / `handle_tool_call` も `&mut Connection` に対応
+- Changed signatures of `ingest_file` / `ingest_dir` / `sync_all` from `&Connection` to `&mut Connection`
+- Same change for `ingest_antigravity::sync_all` / `ingest_brain` / `ingest_session`
+- `mcp::serve` / `handle_request` / `handle_tool_call` updated for `&mut Connection`
 
 ---
 
@@ -153,10 +153,10 @@ Initial release. Fork from [claude-relay](https://github.com/primalcolors/claude
 
 ### Features
 
-- Claude Code (JSONL) と Antigravity (Markdown + JSON) の両ソースに対応
-- ワークスペーススコーピング（`scope=self/cross/all`）
-- PPID による呼び出し元エージェントの自動検出
-- `memory_search` / `memory_get_entry` / `memory_list_sessions` / `memory_get_session` MCP ツール
-- `memory_write_session` / `memory_record_summary` / `memory_unlock_cross_scope` MCP ツール（Antigravity 専用）
-- SQLite WAL + FTS5 による全文検索
-- `archive` / `export` / `list` / `sync` CLI コマンド
+- Supports both Claude Code (JSONL) and Antigravity (Markdown + JSON) sources
+- Workspace scoping (`scope=self/cross/all`)
+- Automatic caller-agent detection via PPID
+- `memory_search` / `memory_get_entry` / `memory_list_sessions` / `memory_get_session` MCP tools
+- `memory_write_session` / `memory_record_summary` / `memory_unlock_cross_scope` MCP tools (Antigravity only)
+- Full-text search with SQLite WAL + FTS5
+- `archive` / `export` / `list` / `sync` CLI commands

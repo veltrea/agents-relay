@@ -2,6 +2,26 @@
 
 **他の言語で読む:** [English](CHANGELOG.md)
 
+## [0.2.2] - 2026-07-13
+
+### compact 会話投影（トークン節約セッション再生）
+
+CoT は既に取り込み時に分離済みで、セッション再生の残る主なトークン食いはツールのペイロード（`Write` のファイル本文、2,000 行の `Read` 結果、長い `Bash` 出力）でした。本リリースはそれらを畳む第 4 の派生ストレージ層を追加します。
+
+- ストレージ層 `compact.db`（`cdb.entry_compact`）を追加: 全エントリの **min/mid** 投影を決定的レシピ（LLM 不使用・`recipe_version` 付き）で生成
+  - min（骨子）: 本文は要点、ツール呼び出しは名前 + 対象（`[Write /x/db.rs]`）、ツール出力は行数/バイト数の 1 行要約
+  - mid（流れと意図）: 本文ほぼ保持、ツール署名 + ペイロードヒント（`[use: Write /x/db.rs (+120 lines)]`）、ツール出力の先頭
+  - エラー系 tool_result は両レベルで残す。CoT は両レベルで除外
+- `memory_get_session` に `detail` パラメータを追加: `gist`（要約のみ）/ `min`（既定）/ `mid` / `full`。各メッセージに `tokens` メニュー `{min,mid,full}` が付き、呼び出し側が選択的にエスカレーションできる（実測: 300KB の tool_result が full≈75,000 トークン → min≈8）
+- `detail='full'` にエントリ単位の転送キャップ（200KB）を適用（`memory_get_entry` と同じ）
+- カラム `raw_entries.content_tokens` を追加（本文全文の概算トークン数。旧行は自動バックフィル）
+- consolidate パスが未生成/stale の投影を materialize する（1 パス最大 2,000 件。`--watch` は compact バックログも busy 扱い）
+- 設定キー `compact_enabled` を追加（既定 true）
+- CLI 追加: `db backfill-compact`（一括バックフィル）/ `db rebuild-compact`（レシピ更新後の全再生成）。`db stats` に投影件数を表示
+- 完全な派生物: `compact.db` を削除しても `memory_get_session` が inline 先頭にフォールバックするだけ
+
+---
+
 ## [0.2.1] - 2026-07-12
 
 ### 無損失 3 層ストレージ

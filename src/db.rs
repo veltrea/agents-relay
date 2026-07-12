@@ -33,6 +33,8 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// - fulltext.db (fdb.fulltext):  CONTENT_INLINE_MAX 超の content 全文。
 ///   将来の再圧縮・再処理のための無損失原本。メイン DB 側には先頭だけを
 ///   inline 保存し FTS 索引もそちらで張る。
+/// - compact.db (cdb.entry_compact): 会話再構成用の軽量投影 (min/mid)。
+///   派生物であり、削除しても再生成できる。get_session が既定で返す層。
 fn attach_side_dbs(conn: &Connection, db_path: &Path) -> Result<()> {
     let rpath = db_path.with_file_name("reasoning.db");
     conn.execute(
@@ -51,10 +53,19 @@ fn attach_side_dbs(conn: &Connection, db_path: &Path) -> Result<()> {
         "ATTACH DATABASE ?1 AS vdb",
         params![vpath.to_string_lossy()],
     )?;
+    // compact.db (cdb): 会話再構成用の軽量投影 (min/mid 2 段)。生 CoT は取り込み時に
+    // 分離済みなので、ここが畳むのは主にツールのペイロード。完全に派生物であり、
+    // 削除しても `db rebuild-compact` / consolidate パスで再生成できる。
+    let cpath = db_path.with_file_name("compact.db");
+    conn.execute(
+        "ATTACH DATABASE ?1 AS cdb",
+        params![cpath.to_string_lossy()],
+    )?;
     conn.execute_batch(
         "PRAGMA rdb.journal_mode=WAL;
          PRAGMA fdb.journal_mode=WAL;
          PRAGMA vdb.journal_mode=WAL;
+         PRAGMA cdb.journal_mode=WAL;
          CREATE TABLE IF NOT EXISTS rdb.cot (
              entry_id INTEGER PRIMARY KEY,
              reasoning TEXT,
@@ -67,6 +78,14 @@ fn attach_side_dbs(conn: &Connection, db_path: &Path) -> Result<()> {
          CREATE TABLE IF NOT EXISTS vdb.vec_meta (
              key TEXT PRIMARY KEY,
              value TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS cdb.entry_compact (
+             entry_id       INTEGER PRIMARY KEY,
+             min_text       TEXT NOT NULL,
+             mid_text       TEXT NOT NULL,
+             min_tokens     INTEGER NOT NULL,
+             mid_tokens     INTEGER NOT NULL,
+             recipe_version INTEGER NOT NULL
          );",
     )?;
     Ok(())
@@ -233,6 +252,7 @@ pub fn init(conn: &Connection) -> Result<()> {
             git_branch TEXT,
             source TEXT NOT NULL DEFAULT 'claude',
             reasoning_tokens INTEGER,
+            content_tokens INTEGER,
             created_at TEXT DEFAULT (datetime('now'))
         );
 
@@ -307,6 +327,13 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has("reasoning_tokens") {
         conn.execute_batch("ALTER TABLE raw_entries ADD COLUMN reasoning_tokens INTEGER;")?;
         eprintln!("Migration: added 'reasoning_tokens' column to raw_entries");
+    }
+
+    // content 本文の概算トークン数ポインタ。compact 投影の detail 選択材料
+    // (full/mid/min のトークン量メニュー) に使う。取り込み時に計算・保存する。
+    if !has("content_tokens") {
+        conn.execute_batch("ALTER TABLE raw_entries ADD COLUMN content_tokens INTEGER;")?;
+        eprintln!("Migration: added 'content_tokens' column to raw_entries");
     }
 
     // 旧レイアウト (raw_entries に reasoning / reasoning_summary が同居) からの移行:
@@ -392,6 +419,7 @@ pub fn reset(conn: &Connection) -> Result<()> {
         DROP TABLE IF EXISTS summaries;
         DELETE FROM rdb.cot;
         DELETE FROM fdb.fulltext;
+        DELETE FROM cdb.entry_compact;
         ",
     )?;
     init(conn)?;
@@ -417,6 +445,12 @@ pub struct RawEntry {
     pub reasoning_summary: Option<String>,
     /// 生 CoT の概算トークン数。ポインタ (has_reasoning) と予算判断に使う。
     pub reasoning_tokens: Option<i64>,
+    /// content 本文 (全文) の概算トークン数。detail=full 相当の重さの目安。
+    pub content_tokens: Option<i64>,
+    /// compact 投影 min/mid の概算トークン数。get_session が detail 選択の
+    /// メニューとして返す (「今は min=4tok、mid=18、full=82」)。未生成なら None。
+    pub min_tokens: Option<i64>,
+    pub mid_tokens: Option<i64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -457,6 +491,8 @@ pub fn insert_entry_full(
     reasoning: Option<&str>,
 ) -> Result<i64> {
     let reasoning_tokens = reasoning.map(crate::reasoning::estimate_tokens);
+    // content 本文 (全文) の概算トークン数。detail 選択のポインタに使う。
+    let content_tokens = crate::reasoning::estimate_tokens(content);
 
     // 切り詰めポリシーはここに集約する。呼び出し側は常に全文を渡してよい。
     // 上限超過分は inline に頭だけ残し、全文を fdb に無損失退避する。
@@ -468,9 +504,9 @@ pub fn insert_entry_full(
         };
 
     conn.execute(
-        "INSERT INTO raw_entries (session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch, source, reasoning_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![session_id, timestamp, date, time, entry_type, tool_name, inline, cwd, git_branch, source, reasoning_tokens],
+        "INSERT INTO raw_entries (session_id, timestamp, date, time, type, tool_name, content, cwd, git_branch, source, reasoning_tokens, content_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![session_id, timestamp, date, time, entry_type, tool_name, inline, cwd, git_branch, source, reasoning_tokens, content_tokens],
     )?;
     let id = conn.last_insert_rowid();
 
@@ -862,6 +898,8 @@ pub fn stats(conn: &Connection) -> Result<String> {
         conn.query_row("SELECT COUNT(*) FROM rdb.cot", [], |row| row.get(0))?;
     let fulltext_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM fdb.fulltext", [], |row| row.get(0))?;
+    let compact_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM cdb.entry_compact", [], |row| row.get(0))?;
 
     // main / rdb それぞれのファイルサイズ
     let mut sizes = String::new();
@@ -885,6 +923,7 @@ pub fn stats(conn: &Connection) -> Result<String> {
          Summaries:  {summary_count}\n\
          CoT stored: {cot_count}\n\
          Fulltext overflow: {fulltext_count}\n\
+         Compact projections: {compact_count}\n\
          Tracked files: {sync_count}\n\
          Databases:{sizes}"
     ))
@@ -944,7 +983,7 @@ pub fn search(
         sql = String::from(
             "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type,
                     r.tool_name, snippet(raw_entries_fts, 0, '>>','<<', '...', 40) as content,
-                    r.cwd, r.git_branch, r.source, r.reasoning_tokens
+                    r.cwd, r.git_branch, r.source, r.reasoning_tokens, r.content_tokens
              FROM raw_entries_fts f
              JOIN raw_entries r ON r.id = f.rowid
              WHERE raw_entries_fts MATCH ?1",
@@ -957,7 +996,7 @@ pub fn search(
         sql = String::from(
             "SELECT id, session_id, timestamp, date, time, type,
                     tool_name, substr(content, 1, 200) as content,
-                    cwd, git_branch, source, reasoning_tokens
+                    cwd, git_branch, source, reasoning_tokens, content_tokens
              FROM raw_entries
              WHERE 1=1",
         );
@@ -1038,6 +1077,9 @@ pub fn search(
             reasoning: None,
             reasoning_summary: None,
             reasoning_tokens: row.get(11)?,
+            content_tokens: row.get(12)?,
+            min_tokens: None,
+            mid_tokens: None,
         })
     })?;
 
@@ -1054,7 +1096,7 @@ pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
         "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type, r.tool_name,
                 COALESCE(f.content, r.content) AS content,
                 r.cwd, r.git_branch, r.source,
-                c.reasoning, c.reasoning_summary, r.reasoning_tokens
+                c.reasoning, c.reasoning_summary, r.reasoning_tokens, r.content_tokens
          FROM raw_entries r
          LEFT JOIN rdb.cot c ON c.entry_id = r.id
          LEFT JOIN fdb.fulltext f ON f.entry_id = r.id
@@ -1077,6 +1119,9 @@ pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
                 reasoning: row.get(11)?,
                 reasoning_summary: row.get(12)?,
                 reasoning_tokens: row.get(13)?,
+                content_tokens: row.get(14)?,
+                min_tokens: None,
+                mid_tokens: None,
             })
         })
         .ok();
@@ -1139,13 +1184,62 @@ pub fn list_sessions(
     Ok(sessions)
 }
 
-/// 特定セッションのエントリ取得
+/// detail に応じた content 列の式を返す (r=raw_entries, cp=cdb.entry_compact, f=fdb.fulltext)。
+/// compact 未生成のエントリ (取り込み直後で consolidate 前など) は inline 先頭 200 文字に
+/// フォールバックする。これは要約が付くのが consolidate 後という既存挙動と一貫している。
+/// detail は呼び出し側で固定集合に検証済みなので、式の埋め込みは安全 (SQL インジェクト無し)。
+fn detail_content_expr(detail: &str) -> &'static str {
+    match detail {
+        "full" => "COALESCE(f.content, r.content)",
+        "mid" => "COALESCE(cp.mid_text, substr(r.content, 1, 200))",
+        // "min" (既定) とその他は最大圧縮。
+        _ => "COALESCE(cp.min_text, substr(r.content, 1, 200))",
+    }
+}
+
+/// get_session 系の共通 JOIN (compact 投影 + 全文原本)。
+const DETAIL_JOINS: &str = "LEFT JOIN cdb.entry_compact cp ON cp.entry_id = r.id \
+     LEFT JOIN fdb.fulltext f ON f.entry_id = r.id";
+
+/// RawEntry を get_session 系の列順 (content_tokens/min_tokens/mid_tokens 付き) で組み立てる。
+fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<RawEntry> {
+    Ok(RawEntry {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        timestamp: row.get(2)?,
+        date: row.get(3)?,
+        time: row.get(4)?,
+        entry_type: row.get(5)?,
+        tool_name: row.get(6)?,
+        content: row.get(7)?,
+        cwd: row.get(8)?,
+        git_branch: row.get(9)?,
+        source: row.get(10)?,
+        reasoning: None,
+        reasoning_summary: None,
+        reasoning_tokens: row.get(11)?,
+        content_tokens: row.get(12)?,
+        min_tokens: row.get(13)?,
+        mid_tokens: row.get(14)?,
+    })
+}
+
+/// 特定セッションのエントリ取得。detail = "gist"|"min"|"mid"|"full" で content の層を選ぶ
+/// (gist はサーバ層で要約だけ返すため、ここに来る場合は min と同義に扱う)。
 pub fn get_session_entries(
     conn: &Connection,
     session_id: &str,
     entry_type: Option<&str>,
+    detail: &str,
     limit: i64,
 ) -> Result<Vec<RawEntry>> {
+    let content_expr = detail_content_expr(detail);
+    let cols = format!(
+        "r.id, r.session_id, r.timestamp, r.date, r.time, r.type, r.tool_name,
+         {content_expr} AS content, r.cwd, r.git_branch, r.source,
+         r.reasoning_tokens, r.content_tokens, cp.min_tokens, cp.mid_tokens"
+    );
+
     let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(t) = entry_type {
         let types: Vec<&str> = t.split(',').collect();
         let placeholders: Vec<String> = (0..types.len()).map(|i| format!("?{}", i + 2)).collect();
@@ -1157,45 +1251,29 @@ pub fn get_session_entries(
         pv.push(Box::new(limit));
         (
             format!(
-                "SELECT id, session_id, timestamp, date, time, type, tool_name,
-                        substr(content, 1, 200) as content, cwd, git_branch, source, reasoning_tokens
-                 FROM raw_entries WHERE session_id = ?1 AND type IN ({})
-                 ORDER BY timestamp ASC LIMIT ?{limit_idx}",
+                "SELECT {cols}
+                 FROM raw_entries r {DETAIL_JOINS}
+                 WHERE r.session_id = ?1 AND r.type IN ({})
+                 ORDER BY r.timestamp ASC LIMIT ?{limit_idx}",
                 placeholders.join(", ")
             ),
             pv,
         )
     } else {
         (
-            "SELECT id, session_id, timestamp, date, time, type, tool_name,
-                    substr(content, 1, 200) as content, cwd, git_branch, source, reasoning_tokens
-             FROM raw_entries WHERE session_id = ?1 AND type IN ('user', 'assistant')
-             ORDER BY timestamp ASC LIMIT ?2"
-                .to_string(),
+            format!(
+                "SELECT {cols}
+                 FROM raw_entries r {DETAIL_JOINS}
+                 WHERE r.session_id = ?1 AND r.type IN ('user', 'assistant')
+                 ORDER BY r.timestamp ASC LIMIT ?2"
+            ),
             vec![Box::new(session_id.to_string()), Box::new(limit)],
         )
     };
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_ref.as_slice(), |row| {
-        Ok(RawEntry {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            timestamp: row.get(2)?,
-            date: row.get(3)?,
-            time: row.get(4)?,
-            entry_type: row.get(5)?,
-            tool_name: row.get(6)?,
-            content: row.get(7)?,
-            cwd: row.get(8)?,
-            git_branch: row.get(9)?,
-            source: row.get(10)?,
-            reasoning: None,
-            reasoning_summary: None,
-            reasoning_tokens: row.get(11)?,
-        })
-    })?;
+    let rows = stmt.query_map(params_ref.as_slice(), map_session_row)?;
 
     let mut entries = Vec::new();
     for row in rows {
@@ -1209,6 +1287,7 @@ pub fn get_entries_by_date_range(
     date_from: &str,
     date_to: &str,
     entry_type: Option<&str>,
+    detail: &str,
     limit: i64,
 ) -> Result<Vec<RawEntry>> {
     let types = entry_type.unwrap_or("user,assistant");
@@ -1225,38 +1304,94 @@ pub fn get_entries_by_date_range(
     let limit_idx = params_vec.len() + 1;
     params_vec.push(Box::new(limit));
 
+    let content_expr = detail_content_expr(detail);
     let sql = format!(
-        "SELECT id, session_id, timestamp, date, time, type, tool_name,
-                substr(content, 1, 200) as content, cwd, git_branch, source, reasoning_tokens
-         FROM raw_entries WHERE date >= ?1 AND date <= ?2 AND type IN ({})
-         ORDER BY timestamp ASC LIMIT ?{limit_idx}",
+        "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type, r.tool_name,
+                {content_expr} AS content, r.cwd, r.git_branch, r.source,
+                r.reasoning_tokens, r.content_tokens, cp.min_tokens, cp.mid_tokens
+         FROM raw_entries r {DETAIL_JOINS}
+         WHERE r.date >= ?1 AND r.date <= ?2 AND r.type IN ({})
+         ORDER BY r.timestamp ASC LIMIT ?{limit_idx}",
         placeholders.join(", ")
     );
 
     let params_ref: Vec<&dyn rusqlite::types::ToSql> = params_vec.iter().map(|b| b.as_ref()).collect();
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_ref.as_slice(), |row| {
-        Ok(RawEntry {
-            id: row.get(0)?,
-            session_id: row.get(1)?,
-            timestamp: row.get(2)?,
-            date: row.get(3)?,
-            time: row.get(4)?,
-            entry_type: row.get(5)?,
-            tool_name: row.get(6)?,
-            content: row.get(7)?,
-            cwd: row.get(8)?,
-            git_branch: row.get(9)?,
-            source: row.get(10)?,
-            reasoning: None,
-            reasoning_summary: None,
-            reasoning_tokens: row.get(11)?,
-        })
-    })?;
+    let rows = stmt.query_map(params_ref.as_slice(), map_session_row)?;
 
     let mut entries = Vec::new();
     for row in rows {
         entries.push(row?);
     }
     Ok(entries)
+}
+
+// ---------------------------------------------------------------------------
+// compact 投影 (cdb.entry_compact) — 会話再構成用の軽量表現 (min/mid 2 段)
+// ---------------------------------------------------------------------------
+
+/// compact 未生成 or recipe_version が古いエントリを最大 limit 件生成する。
+/// 全文 (fdb 退避分を含む) を畳んで min/mid を作り、旧データの content_tokens も
+/// 併せて埋める。戻り値: 生成した件数 (0 ならバックログは空)。
+pub fn generate_compact_batch(conn: &mut Connection, limit: i64) -> Result<u64> {
+    let rows: Vec<(i64, String, Option<String>, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.type, r.tool_name, COALESCE(f.content, r.content)
+             FROM raw_entries r
+             LEFT JOIN fdb.fulltext f ON f.entry_id = r.id
+             LEFT JOIN cdb.entry_compact cp ON cp.entry_id = r.id
+             WHERE cp.entry_id IS NULL OR cp.recipe_version < ?1
+             ORDER BY r.id DESC LIMIT ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![crate::compact::RECIPE_VERSION, limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        rows
+    };
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let tx = conn.transaction()?;
+    let mut n = 0u64;
+    for (id, entry_type, tool_name, content) in &rows {
+        let (min_text, mid_text) =
+            crate::compact::compact_pair(entry_type, tool_name.as_deref(), content);
+        let min_tokens = crate::reasoning::estimate_tokens(&min_text);
+        let mid_tokens = crate::reasoning::estimate_tokens(&mid_text);
+        tx.execute(
+            "INSERT INTO cdb.entry_compact
+                 (entry_id, min_text, mid_text, min_tokens, mid_tokens, recipe_version)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(entry_id) DO UPDATE SET
+                 min_text = ?2, mid_text = ?3, min_tokens = ?4, mid_tokens = ?5, recipe_version = ?6",
+            params![id, min_text, mid_text, min_tokens, mid_tokens, crate::compact::RECIPE_VERSION],
+        )?;
+        // content_tokens が旧データで未設定なら埋める
+        // (取り込み時に入る新データは既に値を持つので NULL 条件で二度書きしない)。
+        tx.execute(
+            "UPDATE raw_entries SET content_tokens = ?1 WHERE id = ?2 AND content_tokens IS NULL",
+            params![crate::reasoning::estimate_tokens(content), id],
+        )?;
+        n += 1;
+    }
+    tx.commit()?;
+    Ok(n)
+}
+
+/// compact 投影を全消し → 全再生成する (レシピ更新時)。戻り値: 生成総数。
+/// FTS の rebuild と同じく「派生物の作り直し」であり、原本には触れない。
+pub fn rebuild_compact(conn: &mut Connection) -> Result<u64> {
+    conn.execute("DELETE FROM cdb.entry_compact", [])?;
+    let mut total = 0u64;
+    loop {
+        let n = generate_compact_batch(conn, 2000)?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    Ok(total)
 }

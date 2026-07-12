@@ -18,12 +18,16 @@ use crate::reasoning;
 const DIGEST_BUDGET_CHARS: usize = 14_000;
 /// 1 メッセージあたりの上限 (文字数)
 const DIGEST_PER_MSG_CHARS: usize = 400;
+/// 1 パスで生成する compact 投影の最大件数 (バックログはパスをまたいで消化)。
+const COMPACT_PASS_MAX: i64 = 2_000;
 
 pub struct ConsolidateStats {
     pub sessions: u64,
     pub llm_summaries: u64,
     pub facts_added: u64,
     pub facts_skipped: u64,
+    /// このパスで materialize した compact 投影の件数。
+    pub compact_generated: u64,
 }
 
 /// 要約が古い/無いセッションを蒸留する。
@@ -52,6 +56,7 @@ pub fn run(
         llm_summaries: 0,
         facts_added: 0,
         facts_skipped: 0,
+        compact_generated: 0,
     };
 
     let targets =
@@ -106,6 +111,21 @@ pub fn run(
         }
     }
 
+    // compact 投影を materialize する (会話再構成用の軽量 min/mid)。原本には触れない
+    // 再生成可能な派生物。要約対象セッションだけでなく未生成の全エントリを対象に、
+    // 1 パス上限までバックログを消化する (残りは次パスへ)。
+    if cfg.compact_enabled {
+        match db::generate_compact_batch(conn, COMPACT_PASS_MAX) {
+            Ok(n) => {
+                stats.compact_generated = n;
+                if n > 0 {
+                    eprintln!("  [consolidate] materialized compact for {n} entries");
+                }
+            }
+            Err(e) => eprintln!("  [consolidate] compact generation skipped: {e}"),
+        }
+    }
+
     // 新しく作られた要約・事実の埋め込みを生成 (best-effort。失敗しても蒸留自体は成立)
     if let Err(e) = embed_missing(conn, cfg) {
         eprintln!("  [consolidate] embedding skipped: {e}");
@@ -153,8 +173,9 @@ pub fn run_watch(conn: &mut Connection) -> Result<()> {
         };
 
         // 処理があれば短い間隔で次パスへ (バックログを速やかに消化)。
-        // 空なら新しい終了セッションを待つポーリング間隔で休む。
-        let sleep_secs = if stats.sessions > 0 {
+        // 要約と compact のどちらかが動いていれば busy 扱いにして、compact の
+        // バックログも滞りなく消化する。空なら終了セッションを待つ間隔で休む。
+        let sleep_secs = if stats.sessions > 0 || stats.compact_generated > 0 {
             cfg.consolidate_busy_secs
         } else {
             cfg.consolidate_idle_secs

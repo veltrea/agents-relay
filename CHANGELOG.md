@@ -2,6 +2,26 @@
 
 **Read this in other languages:** [日本語](CHANGELOG.ja.md)
 
+## [0.2.2] - 2026-07-13
+
+### Compact conversation projections (token-frugal session replay)
+
+Chain-of-thought was already split out at ingest; the remaining token sink in session replay was tool payloads (file bodies in `Write`, 2,000-line `Read` results, long `Bash` output). This release adds a fourth derived storage tier that folds them.
+
+- New storage tier `compact.db` (`cdb.entry_compact`): deterministic, LLM-free **min/mid** projections of every entry, produced by a versioned recipe (`recipe_version`)
+  - min (skeleton): prose points, tool calls collapsed to name + target (`[Write /x/db.rs]`), tool outputs to a one-line lines/bytes summary
+  - mid (flow and intent): near-full prose, tool signatures with payload hints (`[use: Write /x/db.rs (+120 lines)]`), the head of each tool output
+  - Error tool_results are kept at both levels; chain-of-thought is excluded at both
+- `memory_get_session` gains a `detail` parameter: `gist` (session summary only) / `min` (default) / `mid` / `full`; each message carries a `tokens` menu `{min,mid,full}` so the caller can escalate selectively (measured: a 300KB tool result is full≈75,000 tokens → min≈8)
+- `detail='full'` is now transport-capped per entry (200KB), same as `memory_get_entry`
+- New column `raw_entries.content_tokens` (estimated tokens of the full body; backfilled automatically for old rows)
+- The consolidate pass materializes missing/stale projections (up to 2,000 per pass; `--watch` treats a compact backlog as busy work)
+- New config key `compact_enabled` (default true)
+- New CLI: `db backfill-compact` (bulk backfill) / `db rebuild-compact` (full regeneration after a recipe change); `db stats` shows the projection count
+- Fully derived: deleting `compact.db` only makes `memory_get_session` fall back to inline heads
+
+---
+
 ## [0.2.1] - 2026-07-12
 
 ### Lossless three-tier storage

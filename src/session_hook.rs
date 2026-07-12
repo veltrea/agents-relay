@@ -40,7 +40,7 @@ pub fn build_digest(conn: &Connection, workspace: Option<&str>, limit: i64) -> R
 /// セッションの最初の「自然な」ユーザー発言を1行で返す。
 /// slash command 展開・ローカルコマンド出力・システム注入はスキップする。
 fn first_user_line(conn: &Connection, session_id: &str) -> Option<String> {
-    let entries = db::get_session_entries(conn, session_id, Some("user"), 10).ok()?;
+    let entries = db::get_session_entries(conn, session_id, Some("user"), "min", 10).ok()?;
     for e in entries {
         let line = e
             .content

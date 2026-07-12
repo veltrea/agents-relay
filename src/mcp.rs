@@ -286,7 +286,7 @@ fn tool_definitions(scope: &ServerScope) -> Value {
         }),
         json!({
             "name": "memory_get_session",
-            "description": "Retrieve full conversation history of a specific session. High token cost — only use when the user needs to review or continue specific prior work and has identified the session.",
+            "description": "Retrieve the conversation history of a specific session. Returns a token-frugal projection by default. The `detail` parameter controls how much is returned: 'gist' (session summary only), 'min' (default — the conversation skeleton: prose points, tool calls collapsed to name+target, tool outputs to a one-line size summary), 'mid' (flow and intent: near-full prose, tool signatures, head of each tool output), 'full' (complete original message bodies). Chain-of-thought is never included — it is flagged with has_reasoning and fetched via memory_get_reasoning. Each message carries a `tokens` menu ({min,mid,full}) so you can decide whether to re-request a heavier detail. Start with the default 'min' and only escalate for messages you actually need.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -295,6 +295,7 @@ fn tool_definitions(scope: &ServerScope) -> Value {
                     "date_from":  { "type": "string" },
                     "date_to":    { "type": "string" },
                     "type":       { "type": "string", "description": "Filter type (default: user,assistant)" },
+                    "detail":     { "type": "string", "description": "'gist' | 'min' (default) | 'mid' | 'full'. Higher = more tokens. Prefer 'min'; escalate only when needed." },
                     "limit":      { "type": "number", "description": "Max results (default 50)" }
                 }
             },

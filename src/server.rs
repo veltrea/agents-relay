@@ -365,13 +365,36 @@ fn handle_tool(
             let limit = args.get("limit")
                 .and_then(|l| l.as_i64().or_else(|| l.as_f64().map(|f| f as i64)))
                 .unwrap_or(50);
+            // detail: 会話をどの層で返すか。既定 "min" (最大圧縮 = 最小トークン)。
+            //   gist = セッション要約だけ / min = 骨子 / mid = 流れと意図 / full = 本文全文
+            let detail = match args.get("detail").and_then(|d| d.as_str()).unwrap_or("min") {
+                d @ ("gist" | "min" | "mid" | "full") => d,
+                _ => "min",
+            };
+
+            // gist: セッション要約だけを返す (要約が無ければ min にフォールバック)。
+            if detail == "gist" {
+                if let Some(sid) = session_id {
+                    if let Ok(Some(summary)) = db::get_summary(conn, sid) {
+                        return Ok(serde_json::to_string_pretty(&json!([{
+                            "type": "session_summary",
+                            "session_id": sid,
+                            "content": strip_summarizer_marker(&summary),
+                            "detail": "gist",
+                            "hint": "Call again with detail='min'|'mid'|'full' for the actual messages.",
+                        }]))?);
+                    }
+                }
+            }
+            // DB から取り出す実 detail (gist は要約が無かった場合 min で本文を返す)。
+            let db_detail = if detail == "gist" { "min" } else { detail };
 
             let entries = if let Some(sid) = session_id {
-                db::get_session_entries(conn, sid, entry_type, limit)?
+                db::get_session_entries(conn, sid, entry_type, db_detail, limit)?
             } else if date.is_some() || date_from.is_some() || date_to.is_some() {
                 let d_from = date.or(date_from).unwrap_or("2000-01-01");
                 let d_to = date.or(date_to).unwrap_or("2099-12-31");
-                db::get_entries_by_date_range(conn, d_from, d_to, entry_type, limit)?
+                db::get_entries_by_date_range(conn, d_from, d_to, entry_type, db_detail, limit)?
             } else {
                 anyhow::bail!("Provide session_id or date/date_from/date_to");
             };
@@ -386,13 +409,27 @@ fn handle_tool(
                         "time": e.time,
                         "type": e.entry_type,
                         "tool_name": e.tool_name,
-                        "content": e.content,
+                        // detail=full は fdb 全文原本 (数 MB 可) を返しうるので、
+                        // 1 エントリずつ転送上限で切る (min/mid はレシピ上限で有界なので実質 no-op)。
+                        // DB 内の原本は無損失のまま。
+                        "content": cap_for_transport(&e.content),
                         "source": e.source,
                     });
                     add_reasoning_pointer(&mut obj, e.reasoning_tokens);
+                    add_detail_menu(&mut obj, e);
                     obj
                 })
                 .collect();
+            // 先頭に、現在の detail と切り替え方を示すヘッダを 1 つ付ける。
+            result.insert(0, json!({
+                "type": "detail_info",
+                "detail": db_detail,
+                "hint": format!(
+                    "Returned at detail='{db_detail}'. Levels gist<min<mid<full cost progressively more tokens; \
+                     each message's 'tokens' shows the per-level cost. Default is 'min' — escalate only for messages you need. \
+                     memory_get_entry = one full message, memory_get_reasoning = chain-of-thought."
+                ),
+            }));
             // セッション指定なら、consolidate 済み要約を先頭に付ける
             if let Some(sid) = session_id {
                 if let Ok(Some(summary)) = db::get_summary(conn, sid) {
@@ -675,5 +712,24 @@ fn add_reasoning_pointer(obj: &mut Value, reasoning_tokens: Option<i64>) {
             obj["has_reasoning"] = json!(true);
             obj["reasoning_tokens"] = json!(tokens);
         }
+    }
+}
+
+/// エントリに detail 別の概算トークン量メニュー ({min, mid, full}) を付ける。
+/// 呼び出し側エージェントが「今は min、重ければ mid/full」を自分で選べるようにする
+/// (ポインタ経済: 本体は返さず、コストの目安だけ返す)。値が無いレベルは省く。
+fn add_detail_menu(obj: &mut Value, e: &db::RawEntry) {
+    let mut menu = serde_json::Map::new();
+    if let Some(t) = e.min_tokens {
+        menu.insert("min".to_string(), json!(t));
+    }
+    if let Some(t) = e.mid_tokens {
+        menu.insert("mid".to_string(), json!(t));
+    }
+    if let Some(t) = e.content_tokens {
+        menu.insert("full".to_string(), json!(t));
+    }
+    if !menu.is_empty() {
+        obj["tokens"] = Value::Object(menu);
     }
 }

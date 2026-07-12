@@ -2,7 +2,7 @@
 
 **他の言語で読む:** [English](SPEC.md)
 
-対象バージョン: 0.2.1
+対象バージョン: 0.2.2
 
 ## 1. 目的と設計原則
 
@@ -25,7 +25,7 @@ serve (MCP stdio)                       ──┘
 
 ## 3. ストレージ層
 
-すべて `~/.agents-relay/` 配下。`db::open()` が 3 つの DB を ATTACH して単一コネクションで扱う。
+すべて `~/.agents-relay/` 配下。`db::open()` が 4 つの分離 DB を ATTACH して単一コネクションで扱う。
 
 ### 3.1 memory.db（本体）
 
@@ -64,9 +64,16 @@ serve (MCP stdio)                       ──┘
 - `memory_search` は FTS 結果に加えて `match: "semantic"` の近傍（要約 3 件 + 事実 3 件）を付加する。埋め込みサービス不達時は静かに FTS のみになる。
 - 完全な派生物。ファイルごと削除しても `embed` で再生成できる。
 
-### 3.6 転送キャップ
+### 3.6 compact.db（会話投影・ATTACH 名 `cdb`）
 
-MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[transport limit: full N bytes stored losslessly in DB]` を付記）。DB 内は無損失のまま。
+- `entry_compact(entry_id, min_text, mid_text, min_tokens, mid_tokens, recipe_version)` — 会話再構成用のトークン節約投影。2 段: **min**（骨子。本文は要点、ツール呼び出しは名前 + 対象、ツール出力は行数/バイト数の 1 行要約）と **mid**（流れと意図。本文ほぼ保持、ツール署名 + ペイロードヒント、ツール出力の先頭）。エラー系 tool_result は両レベルで残す。CoT は両レベルで除外（取り込み時に分離済み）。
+- 決定的レシピで生成（LLM 不使用）。`recipe_version` で stale 行を検出し、レシピ更新後は `db rebuild-compact` で全再生成する。
+- consolidate パスが materialize する（`compact_enabled` でゲート）。`db backfill-compact` で一括バックフィル。完全な派生物 — ファイルを削除しても `memory_get_session` が inline 先頭にフォールバックするだけ。
+- `memory_get_session detail='min'|'mid'`（既定 `min`）で提供する。`raw_entries.content_tokens`（本文全文の概算トークン数）と `min_tokens` / `mid_tokens` を合わせて、エントリごとのトークンメニュー `{min, mid, full}` として呼び出し側に返し、選択的なエスカレーションを可能にする。
+
+### 3.7 転送キャップ
+
+MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[transport limit: full N bytes stored losslessly in DB]` を付記）。`memory_get_entry`・`memory_get_reasoning`・`memory_get_session detail='full'` にエントリ単位で適用。DB 内は無損失のまま。
 
 ## 4. 取り込み
 
@@ -94,14 +101,15 @@ MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[t
 2. ダイジェスト生成: 各メッセージ 400 字、全体 14,000 字。超過時は先頭 60% + 末尾 40%（中間は省略マーカー）。
 3. 要約: LLM（OpenAI 互換 `/chat/completions`）優先、不達・暴走時は抽出圧縮にフォールバック。経路をマーカーで記録。
 4. 事実抽出（LLM 必須）: `CATEGORY: fact` 形式で抽出し、**新規性ゲート**（既存有効事実との文字バイグラム Jaccard >= 0.6 で重複と判定）を通過したものだけ `facts` へ。
+5. compact 投影: 未生成 or `recipe_version` が古いエントリの min/mid 投影（`cdb.entry_compact`）を materialize する（1 パス最大 2,000 件。バックログはパスをまたいで消化）。`compact_enabled` でゲート。
 
-原本は一切変更しない。要約・事実は再生成可能な派生物。
+原本は一切変更しない。要約・事実・compact 投影は再生成可能な派生物。
 
 ### 5.1 スケジューリング（`--watch`）
 
 蒸留はすでに永続化されたデータへの純粋なバックグラウンドバッチなので、いつ回すかは鮮度に影響するだけで正しさには影響しない。2 つの方針をサポートする:
 
-- **常時圧縮**: `consolidate --watch` がループする — 新規 JSONL を sync し、1 パス（`consolidate_batch` 件）実行、埋め込み、処理があれば `consolidate_busy_secs`、空なら `consolidate_idle_secs` だけ sleep。設定は毎サイクル読み直すため、cadence と `consolidate_enabled` マスタースイッチはプロセス再起動なしで即反映される。launchd / systemd で「終了したら再起動」させて常駐する想定。ウォッチャは毎サイクル `sync_all` も回すので、`server` が動いていなくても自己完結する。
+- **常時圧縮**: `consolidate --watch` がループする — 新規 JSONL を sync し、1 パス（`consolidate_batch` 件）実行、埋め込み、処理（要約または compact 投影）があれば `consolidate_busy_secs`、空なら `consolidate_idle_secs` だけ sleep。設定は毎サイクル読み直すため、cadence と `consolidate_enabled` マスタースイッチはプロセス再起動なしで即反映される。launchd / systemd で「終了したら再起動」させて常駐する想定。ウォッチャは毎サイクル `sync_all` も回すので、`server` が動いていなくても自己完結する。
 - **定期実行**: cron / launchd でワンショット `consolidate` を呼ぶ。
 
 デプロイでは責務を分離する: KeepAlive デーモンが `consolidate --watch`（連続圧縮 + 埋め込み）を担い、日次ジョブが `db backup`（定期スナップショット）を担う。
@@ -112,7 +120,7 @@ MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[t
 |---|---|
 | `memory_search` | FTS 検索。scope=self/cross/all（cross/all はユーザー承認ゲート付き） |
 | `memory_list_sessions` | セッション一覧 + 要約スニペット |
-| `memory_get_session` | セッション履歴（先頭に要約）。type フィルタ既定 user,assistant |
+| `memory_get_session` | セッション履歴（先頭に要約）。`detail` で層を選択: gist（要約のみ）/ min（既定・骨子）/ mid / full。各メッセージに `tokens` メニュー `{min,mid,full}` 付き。type フィルタ既定 user,assistant |
 | `memory_get_entry` | 1 エントリ全文（fulltext 原本、転送キャップあり） |
 | `memory_get_reasoning` | CoT。mode=summary（遅延生成・キャッシュ）/ full |
 | `memory_facts` | 蒸留済み事実の検索（workspace フィルタ対応） |
@@ -121,7 +129,7 @@ MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[t
 
 ## 7. CLI
 
-`serve` / `server` / `ingest` / `sync` / `list` / `export` / `write` / `query` / `summarize` / `consolidate` / `embed` / `archive` / `workspace` / `config` / `db {stats, vacuum, reset, rebuild-fts, export-light, backfill-fulltext, restore-archive, backup}` / `tool`（デバッグ用直接呼び出し）
+`serve` / `server` / `ingest` / `sync` / `list` / `export` / `write` / `query` / `summarize` / `consolidate` / `embed` / `archive` / `workspace` / `config` / `db {stats, vacuum, reset, rebuild-fts, export-light, backfill-fulltext, backfill-compact, rebuild-compact, restore-archive, backup}` / `tool`（デバッグ用直接呼び出し）
 
 サーバーポートは `AGENTS_RELAY_PORT` 環境変数で上書き可能（テスト・並行環境用。既定 54322）。
 
@@ -142,6 +150,7 @@ MCP レスポンスの `content` / `reasoning` は 200,000 bytes で切る（`[t
 | `consolidate_batch` | 10 | watch の 1 パスあたり処理セッション数 |
 | `consolidate_busy_secs` | 15 | 消化中のパス間 sleep 秒 |
 | `consolidate_idle_secs` | 900 | バックログが空のときのポーリング間隔 (秒) |
+| `compact_enabled` | true | consolidate パスで min/mid compact 投影を materialize する |
 
 ## 9. バックアップと復元
 

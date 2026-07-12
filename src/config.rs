@@ -43,6 +43,11 @@ pub struct Config {
     /// --watch でバックログが空のとき、新しい終了セッションを待つポーリング間隔 (秒)。
     #[serde(default = "default_consolidate_idle_secs")]
     pub consolidate_idle_secs: u64,
+    /// compact 投影 (会話再構成用の軽量 min/mid 表現) を consolidate パスで
+    /// materialize するか。false なら生成しない (get_session は inline 先頭に
+    /// フォールバックする)。既定 true。
+    #[serde(default = "default_compact_enabled")]
+    pub compact_enabled: bool,
 }
 
 fn default_retention_days() -> u32 {
@@ -107,6 +112,10 @@ fn default_consolidate_idle_secs() -> u64 {
     900
 }
 
+fn default_compact_enabled() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -123,6 +132,7 @@ impl Default for Config {
             consolidate_batch: default_consolidate_batch(),
             consolidate_busy_secs: default_consolidate_busy_secs(),
             consolidate_idle_secs: default_consolidate_idle_secs(),
+            compact_enabled: default_compact_enabled(),
         }
     }
 }
@@ -214,6 +224,13 @@ impl Config {
             "consolidate_idle_secs" => {
                 self.consolidate_idle_secs = value.parse()?;
             }
+            "compact_enabled" => {
+                self.compact_enabled = match value {
+                    "true" | "1" | "yes" => true,
+                    "false" | "0" | "no" => false,
+                    _ => anyhow::bail!("Invalid value for compact_enabled: {value} (use true/false)"),
+                };
+            }
             _ => {
                 anyhow::bail!("Unknown config key: {key}");
             }
@@ -237,7 +254,8 @@ impl Config {
              consolidate_enabled:        {}\n\
              consolidate_batch:          {}\n\
              consolidate_busy_secs:      {}\n\
-             consolidate_idle_secs:      {}",
+             consolidate_idle_secs:      {}\n\
+             compact_enabled:            {}",
             Self::config_path().display(),
             self.enabled,
             self.retention_days,
@@ -251,7 +269,8 @@ impl Config {
             self.consolidate_enabled,
             self.consolidate_batch,
             self.consolidate_busy_secs,
-            self.consolidate_idle_secs
+            self.consolidate_idle_secs,
+            self.compact_enabled
         )
     }
 }

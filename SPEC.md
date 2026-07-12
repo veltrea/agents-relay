@@ -2,7 +2,7 @@
 
 **Read this in other languages:** [日本語](SPEC.ja.md)
 
-Applies to version: 0.2.1
+Applies to version: 0.2.2
 
 ## 1. Purpose and design principles
 
@@ -25,7 +25,7 @@ serve (MCP stdio)                       ──┘
 
 ## 3. Storage tiers
 
-All under `~/.agents-relay/`. `db::open()` ATTACHes the three databases into one connection.
+All under `~/.agents-relay/`. `db::open()` ATTACHes the four side databases into one connection.
 
 ### 3.1 memory.db (core)
 
@@ -64,9 +64,16 @@ Because the JSONL is append-only, re-runs and crash retries may duplicate lines 
 - `memory_search` augments FTS results with `match: "semantic"` neighbors (3 summaries + 3 facts). If the embedding service is unreachable, search silently degrades to FTS only.
 - Fully derived: the file can be deleted and regenerated with `embed`.
 
-### 3.6 Transport cap
+### 3.6 compact.db (conversation projections, ATTACHed as `cdb`)
 
-MCP response `content` / `reasoning` is capped at 200,000 bytes (annotated with `[transport limit: full N bytes stored losslessly in DB]`). Stored data remains lossless.
+- `entry_compact(entry_id, min_text, mid_text, min_tokens, mid_tokens, recipe_version)` — token-frugal projections of each entry for conversation replay, at two levels: **min** (skeleton: prose points, tool calls collapsed to name + target, tool outputs to a one-line lines/bytes summary) and **mid** (flow and intent: near-full prose, tool signatures with payload hints, the head of each tool output). Error tool_results are kept at both levels; chain-of-thought is excluded at both (it was already split out at ingest).
+- Generated deterministically (no LLM) by a versioned recipe. `recipe_version` marks stale rows; after a recipe change, `db rebuild-compact` regenerates everything.
+- Materialized by the consolidate pass (gated by `compact_enabled`); `db backfill-compact` backfills in bulk. Fully derived — deleting the file only makes `memory_get_session` fall back to inline heads.
+- Served through `memory_get_session detail='min'|'mid'` (default `min`). Together with `raw_entries.content_tokens` (estimated tokens of the full body), `min_tokens` / `mid_tokens` form the per-entry token menu `{min, mid, full}` returned to the caller, so it can escalate selectively.
+
+### 3.7 Transport cap
+
+MCP response `content` / `reasoning` is capped at 200,000 bytes (annotated with `[transport limit: full N bytes stored losslessly in DB]`). Applies per entry to `memory_get_entry`, `memory_get_reasoning`, and `memory_get_session detail='full'`. Stored data remains lossless.
 
 ## 4. Ingest
 
@@ -94,14 +101,15 @@ MCP response `content` / `reasoning` is capped at 200,000 bytes (annotated with 
 2. Digest construction: 400 chars per message, 14,000 chars total; over budget keeps the first 60% + last 40% with an elision marker in between.
 3. Summarization: LLM (OpenAI-compatible `/chat/completions`) first; falls back to extractive compression on failure or runaway output. The path taken is recorded in the marker.
 4. Fact extraction (LLM required): extracts `CATEGORY: fact` lines, and only facts passing the **novelty gate** (character-bigram Jaccard >= 0.6 against existing active facts counts as duplicate) are inserted into `facts`.
+5. Compact projections: materializes min/mid projections (`cdb.entry_compact`) for entries that lack them or carry a stale `recipe_version` (up to 2,000 per pass; the backlog drains across passes). Gated by `compact_enabled`.
 
-Originals are never modified. Summaries and facts are regenerable derived artifacts.
+Originals are never modified. Summaries, facts, and compact projections are regenerable derived artifacts.
 
 ### 5.1 Scheduling (`--watch`)
 
 Because consolidation is a pure background batch over already-persisted data, when it runs only affects freshness, never correctness. Two policies are supported:
 
-- **Continuous**: `consolidate --watch` loops — sync new JSONL, run one pass (batch = `consolidate_batch`), embed, then sleep `consolidate_busy_secs` if it did work or `consolidate_idle_secs` if the backlog was empty. Config is re-read every cycle, so cadence and the `consolidate_enabled` master switch take effect live without restarting the process. Intended to run under launchd/systemd with restart-on-exit. The watcher also runs `sync_all` each cycle, so it is self-sufficient even when no `server` is active.
+- **Continuous**: `consolidate --watch` loops — sync new JSONL, run one pass (batch = `consolidate_batch`), embed, then sleep `consolidate_busy_secs` if it did work (summaries or compact projections) or `consolidate_idle_secs` if the backlog was empty. Config is re-read every cycle, so cadence and the `consolidate_enabled` master switch take effect live without restarting the process. Intended to run under launchd/systemd with restart-on-exit. The watcher also runs `sync_all` each cycle, so it is self-sufficient even when no `server` is active.
 - **Periodic**: a cron/launchd job invoking one-shot `consolidate`.
 
 Deployment separates responsibilities: a KeepAlive daemon runs `consolidate --watch` (continuous compression + embedding), while a daily job runs `db backup` (periodic snapshot).
@@ -112,7 +120,7 @@ Deployment separates responsibilities: a KeepAlive daemon runs `consolidate --wa
 |---|---|
 | `memory_search` | FTS search. scope=self/cross/all (cross/all gated behind user approval) |
 | `memory_list_sessions` | Session list + summary snippets |
-| `memory_get_session` | Session history (summary prepended). Default type filter: user,assistant |
+| `memory_get_session` | Session history (summary prepended). `detail` selects the tier: gist (summary only) / min (default, skeleton) / mid / full; each message carries a `tokens` menu `{min,mid,full}`. Default type filter: user,assistant |
 | `memory_get_entry` | Full text of one entry (fulltext originals; transport-capped) |
 | `memory_get_reasoning` | CoT. mode=summary (lazily generated and cached) / full |
 | `memory_facts` | Search distilled facts (workspace filter supported) |
@@ -121,7 +129,7 @@ Deployment separates responsibilities: a KeepAlive daemon runs `consolidate --wa
 
 ## 7. CLI
 
-`serve` / `server` / `ingest` / `sync` / `list` / `export` / `write` / `query` / `summarize` / `consolidate` / `embed` / `archive` / `workspace` / `config` / `db {stats, vacuum, reset, rebuild-fts, export-light, backfill-fulltext, restore-archive, backup}` / `tool` (direct invocation for debugging)
+`serve` / `server` / `ingest` / `sync` / `list` / `export` / `write` / `query` / `summarize` / `consolidate` / `embed` / `archive` / `workspace` / `config` / `db {stats, vacuum, reset, rebuild-fts, export-light, backfill-fulltext, backfill-compact, rebuild-compact, restore-archive, backup}` / `tool` (direct invocation for debugging)
 
 The server port can be overridden with the `AGENTS_RELAY_PORT` environment variable (for tests and parallel setups; default 54322).
 
@@ -142,6 +150,7 @@ The server port can be overridden with the `AGENTS_RELAY_PORT` environment varia
 | `consolidate_batch` | 10 | Sessions per pass in watch mode |
 | `consolidate_busy_secs` | 15 | Sleep between passes while draining |
 | `consolidate_idle_secs` | 900 | Poll interval when the backlog is empty |
+| `compact_enabled` | true | Materialize min/mid compact projections in the consolidate pass |
 
 ## 9. Backup and restore
 

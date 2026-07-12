@@ -137,7 +137,8 @@ pub fn restore_archive_jsonl(conn: &Connection, path: &Path) -> Result<(u64, u64
 
 /// セッションを Markdown 形式で書き出し
 pub fn export_session(conn: &Connection, session_id: &str) -> Result<String> {
-    let entries = db::get_session_entries(conn, session_id, None, 1000)?;
+    // Markdown エクスポートは本文全文が欲しいので detail=full。
+    let entries = db::get_session_entries(conn, session_id, None, "full", 1000)?;
     if entries.is_empty() {
         anyhow::bail!("No entries found for session: {session_id}");
     }

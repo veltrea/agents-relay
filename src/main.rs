@@ -1,4 +1,5 @@
 mod client;
+mod compact;
 mod config;
 mod consolidate;
 mod db;
@@ -211,6 +212,10 @@ enum DbAction {
     },
     /// Recover full text of previously-truncated entries from source JSONL files
     BackfillFulltext,
+    /// Generate compact projections (min/mid) for entries that lack them
+    BackfillCompact,
+    /// Rebuild all compact projections from scratch (use after a recipe change)
+    RebuildCompact,
     /// Restore entries from a lossless archive JSONL (written by `archive`)
     RestoreArchive {
         /// Path to a .jsonl file under the archive directory
@@ -334,6 +339,28 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            DbAction::BackfillCompact => {
+                let mut total = 0u64;
+                loop {
+                    let n = db::generate_compact_batch(&mut conn, 2000)?;
+                    if n == 0 {
+                        break;
+                    }
+                    total += n;
+                    eprintln!("  generated compact for {total} entries so far...");
+                }
+                println!(
+                    "Generated compact projections for {total} entries (recipe v{}).",
+                    compact::RECIPE_VERSION
+                );
+            }
+            DbAction::RebuildCompact => {
+                let n = db::rebuild_compact(&mut conn)?;
+                println!(
+                    "Rebuilt compact projections for {n} entries (recipe v{}).",
+                    compact::RECIPE_VERSION
+                );
+            }
             DbAction::RestoreArchive { path } => {
                 let (restored, skipped) = export::restore_archive_jsonl(&conn, &path)?;
                 println!("Restored {restored} entries ({skipped} already present, skipped).");
@@ -372,8 +399,8 @@ fn main() -> Result<()> {
             let cfg = config::Config::load()?;
             let stats = consolidate::run(&mut conn, &cfg, limit, min_entries, idle_mins, !no_facts, upgrade)?;
             println!(
-                "Consolidated {} sessions ({} via LLM). Facts: +{} added, {} duplicates skipped.",
-                stats.sessions, stats.llm_summaries, stats.facts_added, stats.facts_skipped
+                "Consolidated {} sessions ({} via LLM). Facts: +{} added, {} duplicates skipped. Compact: +{} entries.",
+                stats.sessions, stats.llm_summaries, stats.facts_added, stats.facts_skipped, stats.compact_generated
             );
             if stats.sessions > 0 && stats.llm_summaries == 0 && cfg.reasoning_llm_enabled {
                 println!("Note: LLM unreachable — summaries used heuristic fallback. Re-run later to upgrade.");
@@ -693,7 +720,7 @@ fn main() -> Result<()> {
                 "memory_get_session" => {
                     let sid = session_id.as_deref().unwrap_or("");
                     let entries =
-                        db::get_session_entries(&conn, sid, None, limit.unwrap_or(50))?;
+                        db::get_session_entries(&conn, sid, None, "min", limit.unwrap_or(50))?;
                     for e in &entries {
                         let ptr = e.reasoning_tokens
                             .filter(|t| *t > 0)

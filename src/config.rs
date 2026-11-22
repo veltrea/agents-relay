@@ -48,6 +48,13 @@ pub struct Config {
     /// フォールバックする)。既定 true。
     #[serde(default = "default_compact_enabled")]
     pub compact_enabled: bool,
+    /// 追加の取り込み元ディレクトリ。~/.claude/projects の他にここも走査する。
+    /// 別マシンから持ってきた JSONL を置く場所を指定する
+    /// (例: ~/.agents-relay/remote/work1/projects)。
+    /// sync_state の鍵はファイルの絶対パスなので、本来の場所と重ならない限り
+    /// 二重取り込みは起きない。
+    #[serde(default = "default_extra_project_dirs")]
+    pub extra_project_dirs: Vec<String>,
 }
 
 fn default_retention_days() -> u32 {
@@ -116,6 +123,10 @@ fn default_compact_enabled() -> bool {
     true
 }
 
+fn default_extra_project_dirs() -> Vec<String> {
+    Vec::new()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -133,6 +144,7 @@ impl Default for Config {
             consolidate_busy_secs: default_consolidate_busy_secs(),
             consolidate_idle_secs: default_consolidate_idle_secs(),
             compact_enabled: default_compact_enabled(),
+            extra_project_dirs: default_extra_project_dirs(),
         }
     }
 }
@@ -231,6 +243,14 @@ impl Config {
                     _ => anyhow::bail!("Invalid value for compact_enabled: {value} (use true/false)"),
                 };
             }
+            // カンマ区切りで複数指定する。空文字を渡すと空になる。
+            "extra_project_dirs" => {
+                self.extra_project_dirs = value
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
             _ => {
                 anyhow::bail!("Unknown config key: {key}");
             }
@@ -255,7 +275,8 @@ impl Config {
              consolidate_batch:          {}\n\
              consolidate_busy_secs:      {}\n\
              consolidate_idle_secs:      {}\n\
-             compact_enabled:            {}",
+             compact_enabled:            {}\n\
+             extra_project_dirs:         {}",
             Self::config_path().display(),
             self.enabled,
             self.retention_days,
@@ -270,7 +291,12 @@ impl Config {
             self.consolidate_batch,
             self.consolidate_busy_secs,
             self.consolidate_idle_secs,
-            self.compact_enabled
+            self.compact_enabled,
+            if self.extra_project_dirs.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.extra_project_dirs.join(", ")
+            }
         )
     }
 }
@@ -284,4 +310,15 @@ pub fn resolve_archive_dir(config: &Config) -> PathBuf {
 pub fn resolve_backup_dir(config: &Config) -> PathBuf {
     let expanded = shellexpand::tilde(&config.backup_dir);
     PathBuf::from(expanded.as_ref())
+}
+
+/// 追加の取り込み元ディレクトリを展開して返す。存在しないものは捨てる。
+pub fn resolve_extra_project_dirs(config: &Config) -> Vec<PathBuf> {
+    config
+        .extra_project_dirs
+        .iter()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| PathBuf::from(shellexpand::tilde(s).as_ref()))
+        .filter(|p| p.exists())
+        .collect()
 }

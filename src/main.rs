@@ -7,6 +7,7 @@ mod detect;
 mod export;
 mod ingest;
 mod ingest_antigravity;
+mod ingest_cursor;
 mod mcp;
 mod reasoning;
 mod server;
@@ -723,10 +724,13 @@ fn main() -> Result<()> {
                     let entries =
                         db::get_session_entries(&conn, sid, None, "min", limit.unwrap_or(50))?;
                     for e in &entries {
-                        let ptr = e.reasoning_tokens
-                            .filter(|t| *t > 0)
-                            .map(|t| format!(" [has_reasoning ~{t}tok]"))
-                            .unwrap_or_default();
+                        let mut ptr = String::new();
+                        if let Some(t) = e.reasoning_tokens.filter(|t| *t > 0) {
+                            ptr.push_str(&format!(" [has_reasoning ~{t}tok]"));
+                        }
+                        if let Some(t) = e.tools_tokens.filter(|t| *t > 0) {
+                            ptr.push_str(&format!(" [has_tools ~{t}tok]"));
+                        }
                         println!("[{}] {} {}: {}{}", e.id, e.time, e.entry_type, e.content, ptr);
                     }
                 }
@@ -766,9 +770,28 @@ fn main() -> Result<()> {
                         None => println!("Not found."),
                     }
                 }
+                "memory_get_tools" => {
+                    let entry_id = id.unwrap_or(0);
+                    let mode = query.as_deref().unwrap_or("summary");
+                    match db::get_tool_trace(&conn, entry_id)? {
+                        None => println!("id={entry_id}: no tool_use trace stored."),
+                        Some((tools_json, tools_summary, tools_tokens)) => {
+                            if mode == "full" {
+                                println!("id={entry_id} mode=full ({tools_tokens} tok)\n{tools_json}");
+                            } else {
+                                let summary = tools_summary.unwrap_or_else(|| {
+                                    "(summary missing; use --query full)".to_string()
+                                });
+                                println!(
+                                    "id={entry_id} mode=summary ({tools_tokens} tok)\n{summary}"
+                                );
+                            }
+                        }
+                    }
+                }
                 _ => {
                     println!("Unknown tool: {name}");
-                    println!("Available: memory_search, memory_get_entry, memory_get_session, memory_get_reasoning");
+                    println!("Available: memory_search, memory_get_entry, memory_get_session, memory_get_reasoning, memory_get_tools");
                     println!("Tip: use 'agents-relay list' for session listing.");
                 }
             }

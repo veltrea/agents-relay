@@ -263,6 +263,8 @@ fn handle_tool(
                     "cwd": e.cwd,
                     "git_branch": e.git_branch,
                     "source": e.source,
+                    "has_tools": e.tools_tokens.map(|t| t > 0).unwrap_or(false),
+                    "tools_tokens": e.tools_tokens,
                 }))?),
                 None => Ok(format!("No entry found with id: {id}")),
             }
@@ -327,6 +329,45 @@ fn handle_tool(
                     "full_tokens": entry.reasoning_tokens,
                     "hint": "Call again with mode='full' for the complete chain-of-thought.",
                 }).to_string())
+            }
+        }
+
+        // tool_use 原本は提示面から分離。mode='summary'(既定)は一行一覧、
+        // mode='full' は tools_json 全体。has_tools=true のエントリだけ呼ぶ。
+        "memory_get_tools" => {
+            let id = args.get("id")
+                .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+                .unwrap_or(0);
+            let mode = args.get("mode").and_then(|m| m.as_str()).unwrap_or("summary");
+
+            match db::get_tool_trace(conn, id)? {
+                None => Ok(json!({
+                    "id": id,
+                    "has_tools": false,
+                    "message": "No tool_use trace stored for this entry.",
+                }).to_string()),
+                Some((tools_json, tools_summary, tools_tokens)) => {
+                    if mode == "full" {
+                        Ok(json!({
+                            "id": id,
+                            "mode": "full",
+                            "tools_json": cap_for_transport(&tools_json),
+                            "tools_tokens": tools_tokens,
+                            "tools_summary": tools_summary,
+                        }).to_string())
+                    } else {
+                        let summary = tools_summary.unwrap_or_else(|| {
+                            "[tools]\n(summary missing; call mode='full')".to_string()
+                        });
+                        Ok(json!({
+                            "id": id,
+                            "mode": "summary",
+                            "tools_summary": summary,
+                            "tools_tokens": tools_tokens,
+                            "hint": "Call again with mode='full' for the complete tools_json.",
+                        }).to_string())
+                    }
+                }
             }
         }
 
@@ -418,6 +459,7 @@ fn handle_tool(
                         "source": e.source,
                     });
                     add_reasoning_pointer(&mut obj, e.reasoning_tokens);
+                    add_tools_pointer(&mut obj, e.tools_tokens);
                     add_detail_menu(&mut obj, e);
                     obj
                 })
@@ -429,7 +471,8 @@ fn handle_tool(
                 "hint": format!(
                     "Returned at detail='{db_detail}'. Levels gist<min<mid<full cost progressively more tokens; \
                      each message's 'tokens' shows the per-level cost. Default is 'min' — escalate only for messages you need. \
-                     memory_get_entry = one full message, memory_get_reasoning = chain-of-thought."
+                     memory_get_entry = one full message, memory_get_reasoning = chain-of-thought, \
+                     memory_get_tools = separated tool_use trace."
                 ),
             }));
             // セッション指定なら、consolidate 済み要約を先頭に付ける
@@ -587,8 +630,9 @@ fn format_entries(entries: &[db::RawEntry]) -> Vec<Value> {
                 "git_branch": e.git_branch,
                 "source": e.source,
             });
-            // CoT 本文は返さず、存在を示すポインタだけ付ける（必要時 memory_get_reasoning で取得）
+            // CoT / tool 原本は返さず、存在を示すポインタだけ付ける
             add_reasoning_pointer(&mut obj, e.reasoning_tokens);
+            add_tools_pointer(&mut obj, e.tools_tokens);
             obj
         })
         .collect()
@@ -713,6 +757,15 @@ fn add_reasoning_pointer(obj: &mut Value, reasoning_tokens: Option<i64>) {
         if tokens > 0 {
             obj["has_reasoning"] = json!(true);
             obj["reasoning_tokens"] = json!(tokens);
+        }
+    }
+}
+
+fn add_tools_pointer(obj: &mut Value, tools_tokens: Option<i64>) {
+    if let Some(tokens) = tools_tokens {
+        if tokens > 0 {
+            obj["has_tools"] = json!(true);
+            obj["tools_tokens"] = json!(tokens);
         }
     }
 }

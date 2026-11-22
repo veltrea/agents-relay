@@ -846,7 +846,7 @@ fn delete_marked(conn: &Connection, session_id: &str, marker: &str) -> Result<()
     Ok(())
 }
 
-/// 1 エントリを raw_entries・FTS・分離 DB (cot / fulltext) から完全に削除する
+/// 1 エントリを raw_entries・FTS・分離 DB (cot / fulltext / tool_trace / compact) から完全に削除する
 fn delete_entry_everywhere(conn: &Connection, id: i64) -> Result<()> {
     conn.execute(
         "DELETE FROM raw_entries_fts WHERE rowid = ?1",
@@ -854,6 +854,8 @@ fn delete_entry_everywhere(conn: &Connection, id: i64) -> Result<()> {
     )?;
     conn.execute("DELETE FROM rdb.cot WHERE entry_id = ?1", rusqlite::params![id])?;
     conn.execute("DELETE FROM fdb.fulltext WHERE entry_id = ?1", rusqlite::params![id])?;
+    conn.execute("DELETE FROM fdb.tool_trace WHERE entry_id = ?1", rusqlite::params![id])?;
+    conn.execute("DELETE FROM cdb.entry_compact WHERE entry_id = ?1", rusqlite::params![id])?;
     conn.execute("DELETE FROM raw_entries WHERE id = ?1", rusqlite::params![id])?;
     Ok(())
 }

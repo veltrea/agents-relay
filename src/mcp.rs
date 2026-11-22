@@ -40,6 +40,7 @@ fn client_to_source(client: &str) -> Option<String> {
     match client {
         "claude-code"  => Some("claude".to_string()),
         "antigravity"  => Some("antigravity".to_string()),
+        "cursor"       => Some("cursor".to_string()),
         _ => None,
     }
 }
@@ -279,7 +280,7 @@ fn tool_definitions(scope: &ServerScope) -> Value {
                     "confirmed":  { "type": "boolean", "description": "Set true ONLY after user explicitly approved cross/all scope." },
                     "opt_out":    { "type": "boolean", "description": "Set true if user declined. Saves 'deny' to .agents-relay.json." },
                     "workspace":  { "type": "string", "description": "Override workspace filter (advanced)." },
-                    "source":     { "type": "string", "description": "Override source filter: claude, antigravity (advanced)." }
+                    "source":     { "type": "string", "description": "Override source filter: claude, antigravity, cursor (advanced)." }
                 },
                 "required": ["query"]
             },
@@ -338,6 +339,19 @@ fn tool_definitions(scope: &ServerScope) -> Value {
             "properties": {
                 "id":   { "type": "number", "description": "Entry id from a search/session result where has_reasoning=true" },
                 "mode": { "type": "string", "description": "'summary' (default, compressed) or 'full' (raw CoT)" }
+            },
+            "required": ["id"]
+        }
+    }));
+
+    tools.push(json!({
+        "name": "memory_get_tools",
+        "description": "Fetch the separated tool_use trace for ONE past memory entry by id. Search and session results deliberately omit raw tool payloads to save tokens — they only flag has_tools=true and tools_tokens. Call this when you need the actual tool trajectory (commands, paths, MCP calls). mode='summary' (default) returns the one-line tool list; mode='full' returns the raw tools_json.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "id":   { "type": "number", "description": "Entry id from a search/session result where has_tools=true" },
+                "mode": { "type": "string", "description": "'summary' (default) or 'full' (raw tools_json)" }
             },
             "required": ["id"]
         }

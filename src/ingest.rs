@@ -107,7 +107,7 @@ pub fn ingest_dir(conn: &mut Connection, dir: &Path) -> Result<u64> {
     Ok(total)
 }
 
-/// Claude Code + Antigravity の全ソースを取り込み
+/// Claude Code + Antigravity + Cursor の全ソースを取り込み
 pub fn sync_all(conn: &mut Connection) -> Result<u64> {
     let mut total = 0u64;
 
@@ -118,8 +118,19 @@ pub fn sync_all(conn: &mut Connection) -> Result<u64> {
         total += ingest_dir(conn, &projects_dir)?;
     }
 
+    // 別マシンから持ってきた JSONL (config の extra_project_dirs)。
+    // sync_state の鍵は絶対パスなので、本来の場所と重ならない限り二重には入らない。
+    if let Ok(cfg) = crate::config::Config::load() {
+        for dir in crate::config::resolve_extra_project_dirs(&cfg) {
+            total += ingest_dir(conn, &dir)?;
+        }
+    }
+
     // Antigravity: ~/.gemini/antigravity/brain 配下
     total += crate::ingest_antigravity::sync_all(conn)?;
+
+    // Cursor: ~/.cursor/projects/*/agent-transcripts/*/*.jsonl
+    total += crate::ingest_cursor::sync_all(conn)?;
 
     Ok(total)
 }
@@ -310,13 +321,23 @@ pub fn backfill_fulltext(conn: &mut Connection) -> Result<(u64, u64, u64)> {
     let mut filled = 0u64;
     let mut cot_filled = 0u64;
 
+    // 走査するディレクトリ: 本来の場所 + config の extra_project_dirs
+    let mut scan_dirs: Vec<std::path::PathBuf> = Vec::new();
     if projects_dir.exists() {
+        scan_dirs.push(projects_dir.clone());
+    }
+    if let Ok(cfg) = crate::config::Config::load() {
+        scan_dirs.extend(crate::config::resolve_extra_project_dirs(&cfg));
+    }
+
+    {
         // .jsonl.bak は Claude Code がセッションを書き直した際の旧版で、
         // 現行ファイルから消えた内容が残っている場合があるため両方走査する
-        let patterns = [
-            format!("{}/**/*.jsonl", projects_dir.to_string_lossy()),
-            format!("{}/**/*.jsonl.bak", projects_dir.to_string_lossy()),
-        ];
+        let mut patterns: Vec<String> = Vec::new();
+        for dir in &scan_dirs {
+            patterns.push(format!("{}/**/*.jsonl", dir.to_string_lossy()));
+            patterns.push(format!("{}/**/*.jsonl.bak", dir.to_string_lossy()));
+        }
         for pattern in &patterns {
         for entry in glob::glob(pattern)? {
             let path = entry?;

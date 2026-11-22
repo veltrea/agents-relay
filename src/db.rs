@@ -33,6 +33,8 @@ pub fn open(path: &Path) -> Result<Connection> {
 /// - fulltext.db (fdb.fulltext):  CONTENT_INLINE_MAX 超の content 全文。
 ///   将来の再圧縮・再処理のための無損失原本。メイン DB 側には先頭だけを
 ///   inline 保存し FTS 索引もそちらで張る。
+/// - fulltext.db (fdb.tool_trace): Cursor 等の tool_use 原本。提示面の content
+///   には載せず、memory_get_tools で必要時のみ取得する。
 /// - compact.db (cdb.entry_compact): 会話再構成用の軽量投影 (min/mid)。
 ///   派生物であり、削除しても再生成できる。get_session が既定で返す層。
 fn attach_side_dbs(conn: &Connection, db_path: &Path) -> Result<()> {
@@ -74,6 +76,12 @@ fn attach_side_dbs(conn: &Connection, db_path: &Path) -> Result<()> {
          CREATE TABLE IF NOT EXISTS fdb.fulltext (
              entry_id INTEGER PRIMARY KEY,
              content TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS fdb.tool_trace (
+             entry_id INTEGER PRIMARY KEY,
+             tools_json TEXT NOT NULL,
+             tools_summary TEXT,
+             tools_tokens INTEGER
          );
          CREATE TABLE IF NOT EXISTS vdb.vec_meta (
              key TEXT PRIMARY KEY,
@@ -253,6 +261,7 @@ pub fn init(conn: &Connection) -> Result<()> {
             source TEXT NOT NULL DEFAULT 'claude',
             reasoning_tokens INTEGER,
             content_tokens INTEGER,
+            tools_tokens INTEGER,
             created_at TEXT DEFAULT (datetime('now'))
         );
 
@@ -340,6 +349,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     if !has("content_tokens") {
         conn.execute_batch("ALTER TABLE raw_entries ADD COLUMN content_tokens INTEGER;")?;
         eprintln!("Migration: added 'content_tokens' column to raw_entries");
+    }
+
+    // tool_use ポインタ。実体は fdb.tool_trace に分離。
+    if !has("tools_tokens") {
+        conn.execute_batch("ALTER TABLE raw_entries ADD COLUMN tools_tokens INTEGER;")?;
+        eprintln!("Migration: added 'tools_tokens' column to raw_entries");
     }
 
     // 旧レイアウト (raw_entries に reasoning / reasoning_summary が同居) からの移行:
@@ -469,6 +484,7 @@ pub fn reset(conn: &Connection) -> Result<()> {
         DROP TABLE IF EXISTS summaries;
         DELETE FROM rdb.cot;
         DELETE FROM fdb.fulltext;
+        DELETE FROM fdb.tool_trace;
         DELETE FROM cdb.entry_compact;
         ",
     )?;
@@ -501,6 +517,8 @@ pub struct RawEntry {
     /// メニューとして返す (「今は min=4tok、mid=18、full=82」)。未生成なら None。
     pub min_tokens: Option<i64>,
     pub mid_tokens: Option<i64>,
+    /// 分離保存した tool_use 原本の概算トークン数。ポインタ (has_tools) 用。
+    pub tools_tokens: Option<i64>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -597,6 +615,67 @@ pub fn set_reasoning_summary(conn: &Connection, id: i64, summary: &str) -> Resul
         params![id, summary],
     )?;
     Ok(())
+}
+
+/// tool_use 原本を分離 DB に保存し、メイン行にポインタ (tools_tokens) を付ける。
+/// content / FTS surface は変えず、提示面には載せない（必要時 memory_get_tools）。
+pub fn set_tool_trace(
+    conn: &Connection,
+    id: i64,
+    tools_json: &str,
+    tools_summary: Option<&str>,
+) -> Result<()> {
+    let tools_tokens = crate::reasoning::estimate_tokens(tools_json) as i64;
+    conn.execute(
+        "INSERT OR REPLACE INTO fdb.tool_trace (entry_id, tools_json, tools_summary, tools_tokens)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![id, tools_json, tools_summary, tools_tokens],
+    )?;
+    conn.execute(
+        "UPDATE raw_entries SET tools_tokens = ?1 WHERE id = ?2",
+        params![tools_tokens, id],
+    )?;
+    Ok(())
+}
+
+/// tool_use 原本を取得。(tools_json, tools_summary, tools_tokens)
+pub fn get_tool_trace(conn: &Connection, id: i64) -> Result<Option<(String, Option<String>, i64)>> {
+    let row = conn
+        .query_row(
+            "SELECT tools_json, tools_summary, COALESCE(tools_tokens, 0)
+             FROM fdb.tool_trace WHERE entry_id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .ok();
+    Ok(row)
+}
+
+/// 指定セッションの source=cursor 行と付随 tool_trace / fulltext / cot / compact を削除する
+/// （transcript が短く書き直されたときの再 ingest 用）。
+pub fn delete_cursor_session(conn: &Connection, session_id: &str) -> Result<u64> {
+    let mut ids: Vec<i64> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM raw_entries WHERE session_id = ?1 AND source = 'cursor'",
+        )?;
+        let rows = stmt.query_map(params![session_id], |row| row.get(0))?;
+        for id in rows {
+            ids.push(id?);
+        }
+    }
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    for id in &ids {
+        conn.execute("DELETE FROM fdb.tool_trace WHERE entry_id = ?1", params![id])?;
+        conn.execute("DELETE FROM fdb.fulltext WHERE entry_id = ?1", params![id])?;
+        conn.execute("DELETE FROM rdb.cot WHERE entry_id = ?1", params![id])?;
+        conn.execute("DELETE FROM cdb.entry_compact WHERE entry_id = ?1", params![id])?;
+        conn.execute("DELETE FROM raw_entries_fts WHERE rowid = ?1", params![id])?;
+        conn.execute("DELETE FROM raw_entries WHERE id = ?1", params![id])?;
+    }
+    Ok(ids.len() as u64)
 }
 
 pub fn get_sync_offset(conn: &Connection, file_path: &str) -> Result<i64> {
@@ -951,6 +1030,8 @@ pub fn stats(conn: &Connection) -> Result<String> {
         conn.query_row("SELECT COUNT(*) FROM rdb.cot", [], |row| row.get(0))?;
     let fulltext_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM fdb.fulltext", [], |row| row.get(0))?;
+    let tool_trace_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM fdb.tool_trace", [], |row| row.get(0))?;
     let compact_count: i64 =
         conn.query_row("SELECT COUNT(*) FROM cdb.entry_compact", [], |row| row.get(0))?;
 
@@ -976,6 +1057,7 @@ pub fn stats(conn: &Connection) -> Result<String> {
          Summaries:  {summary_count}\n\
          CoT stored: {cot_count}\n\
          Fulltext overflow: {fulltext_count}\n\
+         Tool traces: {tool_trace_count}\n\
          Compact projections: {compact_count}\n\
          Tracked files: {sync_count}\n\
          Databases:{sizes}"
@@ -1044,7 +1126,8 @@ pub fn search(
         sql = String::from(
             "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type,
                     r.tool_name, snippet(raw_entries_fts, 0, '>>','<<', '...', 40) as content,
-                    r.cwd, r.git_branch, r.source, r.reasoning_tokens, r.content_tokens
+                    r.cwd, r.git_branch, r.source, r.reasoning_tokens, r.content_tokens,
+                    r.tools_tokens
              FROM raw_entries_fts f
              JOIN raw_entries r ON r.id = f.rowid
              WHERE raw_entries_fts MATCH ?1",
@@ -1059,7 +1142,8 @@ pub fn search(
         sql = String::from(
             "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type,
                     r.tool_name, substr(COALESCE(f.content, r.content), 1, 200) as content,
-                    r.cwd, r.git_branch, r.source, r.reasoning_tokens, r.content_tokens
+                    r.cwd, r.git_branch, r.source, r.reasoning_tokens, r.content_tokens,
+                    r.tools_tokens
              FROM raw_entries r
              LEFT JOIN fdb.fulltext f ON f.entry_id = r.id
              WHERE COALESCE(f.content, r.content) LIKE ?1 ESCAPE '\\'",
@@ -1074,7 +1158,8 @@ pub fn search(
         sql = String::from(
             "SELECT id, session_id, timestamp, date, time, type,
                     tool_name, substr(content, 1, 200) as content,
-                    cwd, git_branch, source, reasoning_tokens, content_tokens
+                    cwd, git_branch, source, reasoning_tokens, content_tokens,
+                    tools_tokens
              FROM raw_entries
              WHERE 1=1",
         );
@@ -1158,6 +1243,7 @@ pub fn search(
             content_tokens: row.get(12)?,
             min_tokens: None,
             mid_tokens: None,
+            tools_tokens: row.get(13)?,
         })
     })?;
 
@@ -1174,7 +1260,8 @@ pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
         "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type, r.tool_name,
                 COALESCE(f.content, r.content) AS content,
                 r.cwd, r.git_branch, r.source,
-                c.reasoning, c.reasoning_summary, r.reasoning_tokens, r.content_tokens
+                c.reasoning, c.reasoning_summary, r.reasoning_tokens, r.content_tokens,
+                r.tools_tokens
          FROM raw_entries r
          LEFT JOIN rdb.cot c ON c.entry_id = r.id
          LEFT JOIN fdb.fulltext f ON f.entry_id = r.id
@@ -1200,6 +1287,7 @@ pub fn get_entry(conn: &Connection, id: i64) -> Result<Option<RawEntry>> {
                 content_tokens: row.get(14)?,
                 min_tokens: None,
                 mid_tokens: None,
+                tools_tokens: row.get(15)?,
             })
         })
         .ok();
@@ -1279,7 +1367,7 @@ fn detail_content_expr(detail: &str) -> &'static str {
 const DETAIL_JOINS: &str = "LEFT JOIN cdb.entry_compact cp ON cp.entry_id = r.id \
      LEFT JOIN fdb.fulltext f ON f.entry_id = r.id";
 
-/// RawEntry を get_session 系の列順 (content_tokens/min_tokens/mid_tokens 付き) で組み立てる。
+/// RawEntry を get_session 系の列順 (content_tokens/min_tokens/mid_tokens/tools_tokens 付き) で組み立てる。
 fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<RawEntry> {
     Ok(RawEntry {
         id: row.get(0)?,
@@ -1299,6 +1387,7 @@ fn map_session_row(row: &rusqlite::Row) -> rusqlite::Result<RawEntry> {
         content_tokens: row.get(12)?,
         min_tokens: row.get(13)?,
         mid_tokens: row.get(14)?,
+        tools_tokens: row.get(15)?,
     })
 }
 
@@ -1315,7 +1404,8 @@ pub fn get_session_entries(
     let cols = format!(
         "r.id, r.session_id, r.timestamp, r.date, r.time, r.type, r.tool_name,
          {content_expr} AS content, r.cwd, r.git_branch, r.source,
-         r.reasoning_tokens, r.content_tokens, cp.min_tokens, cp.mid_tokens"
+         r.reasoning_tokens, r.content_tokens, cp.min_tokens, cp.mid_tokens,
+         r.tools_tokens"
     );
 
     let (sql, params_vec): (String, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(t) = entry_type {
@@ -1386,7 +1476,8 @@ pub fn get_entries_by_date_range(
     let sql = format!(
         "SELECT r.id, r.session_id, r.timestamp, r.date, r.time, r.type, r.tool_name,
                 {content_expr} AS content, r.cwd, r.git_branch, r.source,
-                r.reasoning_tokens, r.content_tokens, cp.min_tokens, cp.mid_tokens
+                r.reasoning_tokens, r.content_tokens, cp.min_tokens, cp.mid_tokens,
+                r.tools_tokens
          FROM raw_entries r {DETAIL_JOINS}
          WHERE r.date >= ?1 AND r.date <= ?2 AND r.type IN ({})
          ORDER BY r.timestamp ASC LIMIT ?{limit_idx}",
